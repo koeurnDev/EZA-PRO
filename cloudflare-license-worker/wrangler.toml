@@ -1,0 +1,14 @@
+name = "eza-pro-license-admin"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "eza-pro-licenses"
+database_id = "a1e194ea-9971-409b-a7c8-38ff665be460"
+
+[vars]
+APP_NAME = "EZA PRO"
+MIN_APP_VERSION = "1.0.0"
+

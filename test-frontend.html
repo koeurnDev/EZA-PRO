@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="km">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ EZA PRO - Frontend Test Page</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            padding: 30px;
+        }
+        
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        .test-section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .test-section h2 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+        
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+            margin-bottom: 10px;
+            transition: all 0.3s;
+        }
+        
+        .btn:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+        }
+        
+        .btn-success {
+            background: #10b981;
+        }
+        
+        .btn-success:hover {
+            background: #059669;
+        }
+        
+        .btn-danger {
+            background: #ef4444;
+        }
+        
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+        
+        .result {
+            margin-top: 15px;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            max-height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+        
+        .result.success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 1px solid #10b981;
+        }
+        
+        .result.error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #ef4444;
+        }
+        
+        .result.info {
+            background: #dbeafe;
+            color: #1e40af;
+            border: 1px solid #3b82f6;
+        }
+        
+        .input-group {
+            margin-bottom: 15px;
+        }
+        
+        .input-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #333;
+            font-weight: 500;
+        }
+        
+        .input-group input,
+        .input-group textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        .input-group textarea {
+            min-height: 80px;
+            font-family: inherit;
+        }
+        
+        .status {
+            padding: 10px 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status.connected {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        
+        .status.disconnected {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .badge.success {
+            background: #10b981;
+            color: white;
+        }
+        
+        .badge.error {
+            background: #ef4444;
+            color: white;
+        }
+        
+        audio {
+            width: 100%;
+            margin-top: 10px;
+        }
+        
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚡ EZA PRO - Frontend Test Page</h1>
+        <p class="subtitle">Test all backend APIs directly in browser (localhost)</p>
+        
+        <div id="status" class="status disconnected">
+            <span>🔴</span>
+            <span>Checking connection...</span>
+        </div>
+        
+        <!-- Health Check -->
+        <div class="test-section">
+            <h2>🏥 1. Health Check</h2>
+            <button class="btn" onclick="testHealth()">Test Health API</button>
+            <div id="health-result"></div>
+        </div>
+        
+        <!-- Configuration -->
+        <div class="test-section">
+            <h2>⚙️ 2. Configuration</h2>
+            <button class="btn" onclick="testGetConfig()">Get Config</button>
+            <button class="btn btn-success" onclick="testSaveConfig()">Save Test Config</button>
+            <div id="config-result"></div>
+        </div>
+        
+        <!-- Translation -->
+        <div class="test-section">
+            <h2>🌏 3. Translation (Gemini API)</h2>
+            <div class="input-group">
+                <label>Chinese Text:</label>
+                <textarea id="translate-input" placeholder="Enter Chinese text...">你好世界
+我爱你
+今天天气很好</textarea>
+            </div>
+            <button class="btn" onclick="testTranslation()">Translate to Khmer</button>
+            <div id="translation-result"></div>
+        </div>
+        
+        <!-- TTS -->
+        <div class="test-section">
+            <h2>🎤 4. Text-to-Speech</h2>
+            <div class="input-group">
+                <label>Khmer Text:</label>
+                <input type="text" id="tts-input" placeholder="Enter Khmer text..." value="សួស្តីអ្នកទាំងអស់គ្នា">
+            </div>
+            <div class="input-group">
+                <label>Voice:</label>
+                <select id="tts-voice" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px;">
+                    <option value="km-KH-PisethNeural">Male (Piseth)</option>
+                    <option value="km-KH-SreymomNeural">Female (Sreymom)</option>
+                </select>
+            </div>
+            <button class="btn" onclick="testTTS()">Generate Audio</button>
+            <button class="btn btn-success" onclick="testGetVoices()">Get Voice List</button>
+            <div id="tts-result"></div>
+        </div>
+        
+        <!-- Drafts -->
+        <div class="test-section">
+            <h2>💾 5. Draft Management</h2>
+            <button class="btn" onclick="testSaveDraft()">Save Test Draft</button>
+            <button class="btn btn-success" onclick="testListDrafts()">List All Drafts</button>
+            <button class="btn btn-danger" onclick="testLoadDraft()">Load Draft</button>
+            <div id="draft-result"></div>
+        </div>
+        
+        <!-- Batch Operations -->
+        <div class="test-section">
+            <h2>🚀 6. Batch Operations</h2>
+            <button class="btn" onclick="testBatchTTS()">Batch TTS (3 items)</button>
+            <button class="btn" onclick="testFullWorkflow()">Full Workflow Test</button>
+            <div id="batch-result"></div>
+        </div>
+    </div>
+
+    <script>
+        // Auto-detect backend URL (works with both dev server and Electron)
+        const BACKEND_URL = window.location.hostname === 'localhost' 
+            ? `http://localhost:${window.location.port || 3001}`
+            : 'http://127.0.0.1:60160'; // Fallback for Electron
+        
+        // Check connection on load
+        window.onload = async () => {
+            await checkConnection();
+        };
+        
+        async function checkConnection() {
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/health`);
+                const data = await res.json();
+                
+                if (data.status === 'ok') {
+                    document.getElementById('status').className = 'status connected';
+                    document.getElementById('status').innerHTML = `
+                        <span>🟢</span>
+                        <span>Connected to backend: ${BACKEND_URL}</span>
+                        <span class="badge success">v${data.version}</span>
+                    `;
+                }
+            } catch (e) {
+                document.getElementById('status').className = 'status disconnected';
+                document.getElementById('status').innerHTML = `
+                    <span>🔴</span>
+                    <span>Backend not reachable. Make sure app is running: npm start</span>
+                `;
+            }
+        }
+        
+        function showResult(elementId, data, isError = false) {
+            const el = document.getElementById(elementId);
+            el.className = `result ${isError ? 'error' : 'success'}`;
+            el.textContent = JSON.stringify(data, null, 2);
+        }
+        
+        function showLoading(elementId) {
+            const el = document.getElementById(elementId);
+            el.className = 'result info';
+            el.innerHTML = '<span class="spinner"></span> Loading...';
+        }
+        
+        // Test Functions
+        async function testHealth() {
+            showLoading('health-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/health`);
+                const data = await res.json();
+                showResult('health-result', data);
+            } catch (e) {
+                showResult('health-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testGetConfig() {
+            showLoading('config-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/config`);
+                const data = await res.json();
+                showResult('config-result', data);
+            } catch (e) {
+                showResult('config-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testSaveConfig() {
+            showLoading('config-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        TEST_VALUE: 'Hello from browser test!',
+                        TIMESTAMP: new Date().toISOString()
+                    })
+                });
+                const data = await res.json();
+                showResult('config-result', data);
+            } catch (e) {
+                showResult('config-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testTranslation() {
+            const text = document.getElementById('translate-input').value.trim();
+            if (!text) return alert('Please enter Chinese text!');
+            
+            showLoading('translation-result');
+            
+            const lines = text.split('\n').filter(l => l.trim());
+            const cues = lines.map((line, i) => ({
+                index: i + 1,
+                text: line,
+                translated: ''
+            }));
+            
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/translation/translate-cues`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cues, useCache: true })
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    const result = {
+                        stats: data.stats,
+                        translations: data.cues.map(c => ({
+                            chinese: c.text,
+                            khmer: c.translated
+                        }))
+                    };
+                    showResult('translation-result', result);
+                } else {
+                    showResult('translation-result', data, true);
+                }
+            } catch (e) {
+                showResult('translation-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testTTS() {
+            const text = document.getElementById('tts-input').value.trim();
+            const voice = document.getElementById('tts-voice').value;
+            
+            if (!text) return alert('Please enter Khmer text!');
+            
+            showLoading('tts-result');
+            
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/tts/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text, voice })
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    const audioUrl = `${BACKEND_URL}${data.audioUrl}`;
+                    const el = document.getElementById('tts-result');
+                    el.className = 'result success';
+                    el.innerHTML = `
+                        <div>✅ Audio generated successfully!</div>
+                        <div>URL: ${data.audioUrl}</div>
+                        <div>Cached: ${data.cached ? 'Yes (reused existing)' : 'No (newly generated)'}</div>
+                        <audio controls src="${audioUrl}">Your browser does not support audio.</audio>
+                    `;
+                } else {
+                    showResult('tts-result', data, true);
+                }
+            } catch (e) {
+                showResult('tts-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testGetVoices() {
+            showLoading('tts-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/tts/voices`);
+                const data = await res.json();
+                showResult('tts-result', data);
+            } catch (e) {
+                showResult('tts-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testSaveDraft() {
+            showLoading('draft-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/drafts/save`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        videoPath: 'D:\\Test\\BrowserTest.mp4',
+                        videoName: 'BrowserTest.mp4',
+                        cues: [
+                            { index: 1, text: '你好', translated: 'សួស្តី' },
+                            { index: 2, text: '谢谢', translated: 'អរគុណ' },
+                            { index: 3, text: '再见', translated: 'លាហើយ' }
+                        ],
+                        timestamp: Date.now()
+                    })
+                });
+                const data = await res.json();
+                showResult('draft-result', data);
+            } catch (e) {
+                showResult('draft-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testListDrafts() {
+            showLoading('draft-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/drafts/list`);
+                const data = await res.json();
+                showResult('draft-result', data);
+            } catch (e) {
+                showResult('draft-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testLoadDraft() {
+            showLoading('draft-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/drafts/load`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        videoPath: 'D:\\Test\\BrowserTest.mp4'
+                    })
+                });
+                const data = await res.json();
+                showResult('draft-result', data);
+            } catch (e) {
+                showResult('draft-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testBatchTTS() {
+            showLoading('batch-result');
+            try {
+                const res = await fetch(`${BACKEND_URL}/api/tts/batch-generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        items: [
+                            { index: 1, text: 'សួស្តី', voice: 'km-KH-PisethNeural' },
+                            { index: 2, text: 'អរគុណ', voice: 'km-KH-SreymomNeural' },
+                            { index: 3, text: 'លាហើយ', voice: 'km-KH-PisethNeural' }
+                        ]
+                    })
+                });
+                const data = await res.json();
+                showResult('batch-result', data);
+            } catch (e) {
+                showResult('batch-result', { error: e.message }, true);
+            }
+        }
+        
+        async function testFullWorkflow() {
+            const el = document.getElementById('batch-result');
+            el.className = 'result info';
+            el.innerHTML = '<span class="spinner"></span> Running full workflow test...';
+            
+            const results = [];
+            
+            try {
+                // Step 1: Health check
+                results.push('1. Health check...');
+                const health = await fetch(`${BACKEND_URL}/api/health`);
+                results.push('   ✅ Backend online');
+                
+                // Step 2: Save draft
+                results.push('2. Saving draft...');
+                const draft = await fetch(`${BACKEND_URL}/api/drafts/save`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        videoPath: 'D:\\Test\\WorkflowTest.mp4',
+                        cues: [{ index: 1, text: 'Test', translated: 'តេស្ត' }]
+                    })
+                });
+                const draftData = await draft.json();
+                results.push(`   ✅ Draft saved (key: ${draftData.draftKey})`);
+                
+                // Step 3: Load draft
+                results.push('3. Loading draft...');
+                const load = await fetch(`${BACKEND_URL}/api/drafts/load`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ draftKey: draftData.draftKey })
+                });
+                results.push('   ✅ Draft loaded');
+                
+                // Step 4: Generate TTS
+                results.push('4. Generating TTS...');
+                const tts = await fetch(`${BACKEND_URL}/api/tts/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: 'តេស្ត', voice: 'km-KH-PisethNeural' })
+                });
+                const ttsData = await tts.json();
+                results.push(`   ✅ Audio generated: ${ttsData.audioUrl}`);
+                
+                results.push('\n🎉 Full workflow completed successfully!');
+                
+                el.className = 'result success';
+                el.textContent = results.join('\n');
+            } catch (e) {
+                results.push(`\n❌ Error: ${e.message}`);
+                el.className = 'result error';
+                el.textContent = results.join('\n');
+            }
+        }
+    </script>
+</body>
+</html>

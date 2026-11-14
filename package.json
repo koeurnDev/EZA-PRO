@@ -1,0 +1,128 @@
+{
+  "name": "eza-pro",
+  "productName": "EZA PRO",
+  "version": "1.0.0",
+  "description": "⚡ Professional AI Dubbing & Subtitle Studio for Desktop",
+  "main": "main.js",
+  "scripts": {
+    "start": "node -e \"delete process.env.ELECTRON_RUN_AS_NODE; const { spawn } = require('child_process'); const p = spawn(require('electron'), ['.'], { stdio: 'inherit', windowsHide: false }); p.on('exit', c => process.exit(c || 0));\"",
+    "dev": "node server-dev.js",
+    "dev:electron": "NODE_ENV=development electron .",
+    "test": "node test-api.js",
+    "test:frontend": "start test-frontend.html",
+    "test:watch": "nodemon --exec node test-api.js",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux",
+    "build:all": "electron-builder -mwl"
+  },
+  "keywords": ["video", "subtitle", "dubbing", "ai", "translation", "tts"],
+  "author": "EZA PRO",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@andresaya/edge-tts": "^1.9.1",
+    "dotenv": "^18.0.10",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "electron": "^45.3.1",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "com.ezapro.app",
+    "productName": "EZA PRO",
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "node_modules/**/*",
+      "package.json",
+      "build/icon.png",
+      "LICENSE.txt",
+      ".env.example",
+      "audio_cache/.gitkeep",
+      "drafts/.gitkeep",
+      "translation_cache.js",
+      "!.env",
+      "!.env.local",
+      "!.gemini-accounts.json",
+      "!config.json",
+      "!accounts.json",
+      "!tools/**",
+      "!cloudflare-license-worker/**",
+      "!uploads/**",
+      "!Exported/**",
+      "!translation_cache/**",
+      "!bgm_cache/**",
+      "!cloned_voices/**",
+      "!audio_cache/*.mp3",
+      "!drafts/*.json",
+      "!test-*",
+      "!server-dev.js",
+      "!run-tunnel*",
+      "!*.log",
+      "!*.local.txt",
+      "!*.md",
+      "!dist/**"
+    ],
+    "extraResources": [
+      {
+        "from": "tools/bin",
+        "to": "bin",
+        "filter": [
+          "ffmpeg.exe"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "EZA PRO",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "license": "LICENSE.txt"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable.${ext}"
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "icon": "build/icon.png",
+      "category": "public.app-category.video",
+      "darkModeSupport": true
+    },
+    "dmg": {
+      "title": "${productName} ${version}",
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "build/icon.png",
+      "category": "Video;AudioVideo",
+      "synopsis": "Professional AI Dubbing & Subtitle Studio"
+    }
+  }
+}

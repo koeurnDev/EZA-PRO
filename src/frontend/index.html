@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="km">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+  <meta name="theme-color" content="#070b16">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>EZA PRO - AI Dubbing & Subtitle Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Kantumruy+Pro:ital,wght@0,400;0,600;0,700;0,800;1,700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css?v=20261114z">
+</head>
+<body>
+
+
+  <!-- Top Bar -->
+  <div class="topbar">
+    <div class="brand-wrap" onclick="openHdrgDramaPicker()">
+      <div class="shark-logo-icon">⚡</div>
+      <div class="brand-title">EZA</div>
+      <span id="brandProBadge" class="brand-badge" onclick="handleBrandBadgeTap(event)">PRO</span>
+    </div>
+
+    <div class="topbar-center">
+      <input type="file" id="videoFileInput" accept="video/mp4,video/*" style="display:none;" onchange="handleVideoUpload(event)">
+      <input type="file" id="batchVideoFilesInput" accept="video/mp4,video/*" multiple style="display:none;" onchange="handleBatchVideoUpload(event)">
+      <input type="file" id="srtFileInput" accept=".srt,.txt" style="display:none;" onchange="handleSrtUpload(event)">
+      <input type="file" id="logoFileInput" accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp,.svg,.mp4,.mov,.webm" style="display:none;" onchange="handleLogoFileUpload(event)">
+      <input type="file" id="sponsorFileInput" accept="video/*,image/*,.mp4,.mov,.webm,.mkv,.m4v,.png,.jpg,.jpeg,.webp,.gif,.bmp,.svg" style="display:none;" onchange="handleSponsorFileUpload(event)">
+      <div class="topbar-open-actions" aria-label="បើកប្រភពឯកសារ">
+        <button id="btnTopOpenDrama" class="top-btn source-folder-btn" onclick="openHdrgDramaPicker()" title="ជ្រើសរើសរឿងពី HDRG">📂 រឿង</button>
+        <button id="btnTopOpenFolder" class="top-btn" onclick="openImportFolderDialog()" title="ស្កេន Folder រឿង">📁 Folder</button>
+        <button id="btnTopOpenVideo" class="top-btn" onclick="openVideoFile()" title="បើកវីដេអូ ១ ឯកសារ">🎬 Video</button>
+        <button id="btnTopOpenSrt" class="top-btn" onclick="openSrtFile()" title="នាំចូល File .SRT">📝 SRT</button>
+      </div>
+
+      <label class="top-ep-badge" for="episodeSelect">
+        <span>ភាគ</span>
+        <select id="episodeSelect" class="top-ep-select" onchange="onEpisodeChange(this.value)">
+          <option value="1">1</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="topbar-right">
+      <button id="btnMobileConnect" class="top-btn" onclick="openMobileConnectModal()" title="ភ្ជាប់ទូរស័ព្ទ (QR / Link) និងគ្រប់គ្រងសិទ្ធិអ្នកប្រើ">📱 ទូរស័ព្ទ</button>
+      <button class="top-btn draft-action" onclick="saveDraftNow()" title="រក្សាទុក Draft">💾 Save</button>
+      <button class="top-btn draft-action" onclick="openDraftsModal()" title="បើក Drafts ដែលបានរក្សាទុក">📋 Drafts</button>
+      <button class="btn-export" onclick="openExportModal()">✨ EXPORT</button>
+    </div>
+  </div>
+
+  <!-- Optional System Maintenance / Announcement Banner -->
+  <div id="maintenanceAnnouncementBar" style="display:none; background:linear-gradient(90deg, rgba(245,158,11,0.18), rgba(14,165,233,0.16)); border-bottom:1px solid rgba(245,158,11,0.4); padding:6px 14px; font-size:12px; color:#fef3c7; align-items:center; justify-content:space-between; gap:10px;">
+    <span id="maintenanceAnnouncementText">📢 សេចក្ដីជូនដំណឹងពីប្រព័ន្ធ</span>
+    <button type="button" class="top-btn" style="padding:2px 8px; font-size:10px;" onclick="this.parentElement.style.display='none'">✕</button>
+  </div>
+
+  <!-- App Shell: Collapsible Navigation Sidebar + Active Workspace -->
+  <div class="app-shell">
+    <aside id="appSidebar" class="app-sidebar" aria-label="ការគ្រប់គ្រងប្រព័ន្ធ">
+      <div class="app-sidebar-head">
+        <span class="app-sidebar-title">MENU</span>
+        <button id="appSidebarToggleBtn" class="app-sidebar-toggle" type="button" onclick="toggleAppSidebar()" title="បង្រួម / ពង្រីក Sidebar" aria-expanded="true">◀</button>
+      </div>
+
+      <nav class="app-sidebar-nav" aria-label="មុខងារគ្រប់គ្រងចម្បង">
+        <button id="navBtnStudio" class="app-sidebar-btn active" type="button" data-view="studio" onclick="switchAppView('studio')" title="ស្ទូឌីយោ កែ Subtitle និង Dubbing">
+          <span class="app-sidebar-icon">🎬</span>
+          <span class="app-sidebar-text">
+            <strong>Studio</strong>
+            <small>កែ Subtitle & Dub</small>
+          </span>
+        </button>
+
+        <button id="navBtnVideoManager" class="app-sidebar-btn vm-nav-btn" type="button" data-view="video-manager" onclick="switchAppView('video-manager')" title="គ្រប់គ្រង និងដំណើរការ Auto បកប្រែ + សំឡេងច្រើនវីដេអូព្រមគ្នា">
+          <span class="app-sidebar-icon">⚡</span>
+          <span class="app-sidebar-text">
+            <strong>Video Manager</strong>
+            <small>Auto ច្រើនវីដេអូ</small>
+          </span>
+          <span id="vmTopBadge" class="vm-top-badge" hidden>0</span>
+        </button>
+
+        <button id="navBtnRouter" class="app-sidebar-btn router-manage-trigger" type="button" data-view="router" onclick="switchAppView('router')" aria-controls="routerSidebar" title="គ្រប់គ្រង Gemini Account Pool និងលំហូរ API">
+          <span class="app-sidebar-icon">🔀</span>
+          <span class="app-sidebar-text">
+            <strong>Router Manager</strong>
+            <small>Gemini API Pool</small>
+          </span>
+          <span id="routerSidebarBadge" class="vm-top-badge router-nav-badge" hidden>0</span>
+        </button>
+      </nav>
+    </aside>
+
+    <main id="appMainStage" class="app-main-stage">
+      <div id="studioViewPane" class="studio-view-pane" data-mobile-mode="split">
+        <!-- Mobile Quick View Switcher (visible on phones <= 860px) -->
+        <div id="mobileStudioModeBar" class="mobile-studio-mode-bar" role="tablist" aria-label="របៀបបង្ហាញលើទូរស័ព្ទ">
+          <button type="button" class="mobile-studio-tab active" data-mobile-mode="split" onclick="setMobileStudioMode('split')">👁️ វីដេអូ + អក្សរ</button>
+          <button type="button" class="mobile-studio-tab" data-mobile-mode="script" onclick="setMobileStudioMode('script')">📝 AI & កែអក្សរពេញ</button>
+          <button type="button" class="mobile-studio-tab" data-mobile-mode="player" onclick="setMobileStudioMode('player')">📱 វីដេអូ & Logo</button>
+        </div>
+        <!-- Studio Workspace -->
+        <div class="studio-workspace">
+
+    <!-- Left: 9:16 Video Player Area -->
+    <div class="player-section">
+      <div class="player-top-tools">
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <span id="currentDramaTitleTag" style="font-size: 11px; font-weight: 700; color: #fff; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">មើលវីដេអូជាមុន</span>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <span style="cursor: pointer; font-size: 13px;" onclick="resetVideoToStart()" title="ត្រឡប់ទៅដើម">↺</span>
+          <span style="cursor: pointer; font-size: 13px;" onclick="toggleFullscreen()" title="ពង្រីកពេញអេក្រង់">⛶</span>
+        </div>
+      </div>
+
+      <div class="video-viewport-wrap" id="videoDropZone">
+        <!-- Vertical 9:16 Phone Frame -->
+        <div class="video-frame-916">
+          <video id="mainVideo" class="video-element" crossorigin="anonymous" playsinline ontimeupdate="onVideoTimeUpdate()" onloadedmetadata="onVideoLoaded()"></video>
+
+          <!-- Tap-to-Upload Empty State Prompt (auto-hides once a video is loaded) -->
+          <button type="button" id="videoEmptyUploadPrompt" class="video-empty-upload-prompt" onclick="openVideoFile()" title="ចុចដើម្បីជ្រើសរើសវីដេអូពីទូរស័ព្ទ ឬកុំព្យូទ័រ">
+            <span class="video-empty-upload-icon">📲</span>
+            <strong class="video-empty-upload-title">ចុចទីនេះដើម្បីជ្រើសរើសវីដេអូ</strong>
+            <small class="video-empty-upload-sub">គាំទ្រ MP4 / MOV ពីទូរស័ព្ទ និងកុំព្យូទ័រ</small>
+          </button>
+
+          <div id="safeZoneOverlay" class="safe-zone-overlay" style="display:none;">
+            <div class="safe-zone-center-box"><span class="safe-zone-tag">📱 TIKTOK / REELS SAFE ZONE</span></div>
+            <div class="safe-zone-right-bar"><span>❤️</span><span>💬</span><span>↗️</span></div>
+            <div class="safe-zone-bottom-bar"><span>@creator • Original Sound 🎵</span></div>
+          </div>
+
+          <!-- Subtitle Mask Box (Direct overlay by default; optional background mask) -->
+          <div id="subtitleMaskBox" class="subtitle-mask-box feathered hidden-mask">
+            <div id="liveSubtitleText" class="subtitle-text-inside style-tiktok" style="display:none;"></div>
+          </div>
+
+          <!-- Optional Logo Overlay (Live Preview & Draggable) -->
+          <div id="logoOverlayBox" class="sponsor-overlay-box pos-top-right" hidden title="អូសដើម្បីប្ដូរទីតាំង Logo">
+            <img id="logoOverlayImg" class="sponsor-overlay-media" alt="Logo Overlay" hidden>
+            <video id="logoOverlayVideo" class="sponsor-overlay-media" autoplay loop muted playsinline hidden></video>
+          </div>
+
+          <!-- Optional Sponsor Video / Banner Overlay (Live Preview & Draggable) -->
+          <div id="sponsorOverlayBox" class="sponsor-overlay-box pos-bottom-center" hidden title="អូសដើម្បីប្ដូរទីតាំងវីដេអូ Sponsor">
+            <img id="sponsorOverlayImg" class="sponsor-overlay-media" alt="Sponsor Overlay" hidden>
+            <video id="sponsorOverlayVideo" class="sponsor-overlay-media" autoplay loop muted playsinline hidden></video>
+          </div>
+        </div>
+      </div>
+
+      <!-- Player Controls -->
+      <div class="player-control-bar">
+        <div class="player-scrubber-wrap" id="scrubberTrack" onclick="seekByScrubber(event)">
+          <div id="scrubberFill" class="player-scrubber-fill">
+            <div class="player-scrubber-thumb"></div>
+          </div>
+        </div>
+        <div class="player-controls-row">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <button id="btnPlayPause" onclick="togglePlayPause()" style="background:none; border:none; color:#fff; cursor:pointer; font-size:13px;">▶️</button>
+            <span id="playerTimeText" class="player-time-badge">0:00.0 / 0:00.0</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <select id="speedSelect" class="mini-select" onchange="document.getElementById('mainVideo').playbackRate = parseFloat(this.value)">
+              <option value="1">1x</option>
+              <option value="1.25">1.25x</option>
+              <option value="1.5">1.5x</option>
+              <option value="0.75">0.75x</option>
+            </select>
+            <div class="switch-wrap" onclick="toggleDubVoice()" title="បើក/បិទសំឡេងនិយាយ Dub Voice">
+              <span style="color: #64748b; font-size: 11px;">Dub Voice</span>
+              <div id="dubVoiceSwitch" class="switch-box active">
+                <div class="switch-knob"></div>
+              </div>
+            </div>
+            <span id="volIcon" style="font-size: 12px; cursor: pointer;" onclick="toggleMuteVideo()">🔊</span>
+          </div>
+        </div>
+
+        <details class="player-options">
+          <summary class="secondary-toggle">⚙️ ការកំណត់ Subtitle និង Preview</summary>
+          <div class="player-options-content">
+            <div class="preview-options-row">
+              <label class="preview-option">
+                <span>រចនាប័ទ្ម</span>
+                <select id="subStyleSelect" class="mini-select" onchange="changeSubStyle(this.value)">
+                  <option value="tiktok" selected>🔥 TikTok Gold (មាសដិត)</option>
+                  <option value="hormozi">⚡ Hormozi Viral (បៃតងដិត)</option>
+                  <option value="mrbeast">👑 MrBeast 3D (ស-ខៀវ)</option>
+                  <option value="capcut_box">🟨 CapCut Box (ប្រអប់លឿង)</option>
+                  <option value="drama_red">🎬 Drama Ruby (ស-គែមក្រហម)</option>
+                  <option value="cinema">🎥 Cinema (ភាពយន្ត)</option>
+                  <option value="pill">💊 Dark Pill (ប្រអប់ខ្មៅ)</option>
+                  <option value="neon">💎 Cyber Neon (ពន្លឺ Neon)</option>
+                </select>
+              </label>
+              <label class="preview-option">
+                <input type="checkbox" id="wordPopToggleCheck" checked onchange="setWordPopEffect(this.checked)">
+                <span>🎯 អក្សរលោតមកមុខ</span>
+              </label>
+              <label class="preview-option">
+                <input type="checkbox" id="safeZoneToggle" onchange="toggleSafeZone(this.checked)">
+                <span>📱 Safe Zone</span>
+              </label>
+              <label class="preview-option font-size-option">
+                <span>ទំហំ</span>
+                <input type="range" id="subFontSizeSlider" min="12" max="22" value="16" oninput="updateSubFontSize(this.value)">
+              </label>
+            </div>
+            <div class="mask-controls">
+              <label class="mask-enabled">
+                <input type="checkbox" id="maskToggleCheck" onchange="toggleMaskBox(this.checked)">
+                <span>ផ្ទៃខាងក្រោយ (បាំងអក្សរដើម)</span>
+              </label>
+              <select id="maskModeSelect" class="mini-select" onchange="changeMaskMode(this.value)" aria-label="របៀបបាំងអក្សរចិន">
+                <option value="feathered">ព្រិលស្រាល (Feathered)</option>
+                <option value="cinema_bar">របាររោងកុន</option>
+                <option value="blur">ព្រិល (Blur)</option>
+                <option value="black">ខ្មៅ</option>
+                <option value="frosted">កញ្ចក់ព្រិល</option>
+              </select>
+              <label class="mask-slider"><span>ទីតាំង</span><input type="range" id="maskYSlider" min="30" max="140" value="70" oninput="updateMaskY(this.value)" title="រំកិលប្រអប់បាំងអក្សរឡើង ឬចុះ"></label>
+              <label class="mask-slider"><span>កម្ពស់</span><input type="range" id="maskHSlider" min="25" max="80" value="48" oninput="updateMaskH(this.value)" title="កែតម្រូវកម្ពស់ប្រអប់បាំង"></label>
+            </div>
+            <div class="mask-controls sponsor-controls">
+              <label class="mask-enabled" title="បើក ឬបិទរូប Logo លើវីដេអូ (មិនដាក់ក៏បាន)">
+                <input type="checkbox" id="logoToggleCheck" onchange="toggleLogoOverlay(this.checked)">
+                <span>🖼️ Logo (មិនដាក់ក៏បាន)</span>
+              </label>
+              <div class="sponsor-file-row">
+                <button type="button" id="btnPickLogo" class="top-btn" style="padding:3px 7px; font-size:10.5px;" onclick="pickLogoOverlayFile()" title="រើសរូប Logo (.png, .jpg, .webp, .gif)">🖼️ រើស Logo...</button>
+                <img id="logoMiniThumbImg" class="sponsor-mini-thumb" alt="" hidden>
+                <video id="logoMiniThumbVideo" class="sponsor-mini-thumb" autoplay loop muted playsinline hidden></video>
+                <span id="logoFileNameLabel" class="sponsor-file-badge" style="cursor:pointer;" onclick="pickLogoOverlayFile()" title="ចុចដើម្បីរើសឯកសារ Logo">មិនដាក់</span>
+                <button type="button" id="btnClearLogo" class="top-btn" style="padding:3px 6px; font-size:10px;" onclick="clearLogoOverlayFile()" title="ដក Logo ចេញ" hidden>✕</button>
+              </div>
+              <select id="logoPosSelect" class="mini-select" onchange="changeLogoPosition(this.value)" aria-label="ទីតាំង Logo">
+                <option value="top-right" selected>↗ លើ-ស្ដាំ</option>
+                <option value="top-left">↖ លើ-ឆ្វេង</option>
+                <option value="top-center">↑ លើ-កណ្តាល</option>
+                <option value="bottom-right">↘ ក្រោម-ស្ដាំ</option>
+                <option value="bottom-left">↙ ក្រោម-ឆ្វេង</option>
+                <option value="bottom-center">↓ ក្រោម-កណ្តាល</option>
+                <option value="custom">✥ អូសដោយដៃ</option>
+              </select>
+              <label class="mask-slider" title="កែតម្រូវទំហំ Logo (%)"><span>ទំហំ</span><input type="range" id="logoScaleSlider" min="8" max="55" value="18" oninput="updateLogoScale(this.value)"></label>
+              <label class="mask-slider" title="កែតម្រូវភាពច្បាស់ Logo (%)"><span>ច្បាស់</span><input type="range" id="logoOpacitySlider" min="20" max="100" value="100" oninput="updateLogoOpacity(this.value)"></label>
+            </div>
+            <div class="mask-controls sponsor-controls">
+              <label class="mask-enabled" title="បើក ឬបិទវីដេអូ Sponsor លើវីដេអូ (មិនដាក់ក៏បាន)">
+                <input type="checkbox" id="sponsorToggleCheck" onchange="toggleSponsorOverlay(this.checked)">
+                <span>🎬 Sponsor (មិនដាក់ក៏បាន)</span>
+              </label>
+              <div class="sponsor-file-row">
+                <button type="button" id="btnPickSponsor" class="top-btn" style="padding:3px 7px; font-size:10.5px;" onclick="pickSponsorOverlayFile()" title="រើសវីដេអូ Sponsor (.mp4, .mov, .webm) ឬបដា">🎬 រើស Sponsor...</button>
+                <img id="sponsorMiniThumbImg" class="sponsor-mini-thumb" alt="" hidden>
+                <video id="sponsorMiniThumbVideo" class="sponsor-mini-thumb" autoplay loop muted playsinline hidden></video>
+                <span id="sponsorFileNameLabel" class="sponsor-file-badge" style="cursor:pointer;" onclick="pickSponsorOverlayFile()" title="ចុចដើម្បីរើសឯកសារវីដេអូ Sponsor">មិនដាក់</span>
+                <button type="button" id="btnClearSponsor" class="top-btn" style="padding:3px 6px; font-size:10px;" onclick="clearSponsorOverlayFile()" title="ដក Sponsor ចេញ" hidden>✕</button>
+              </div>
+              <select id="sponsorPosSelect" class="mini-select" onchange="changeSponsorPosition(this.value)" aria-label="ទីតាំង Sponsor">
+                <option value="bottom-center" selected>↓ ក្រោម-កណ្តាល</option>
+                <option value="top-right">↗ លើ-ស្ដាំ</option>
+                <option value="top-left">↖ លើ-ឆ្វេង</option>
+                <option value="top-center">↑ លើ-កណ្តាល</option>
+                <option value="bottom-right">↘ ក្រោម-ស្ដាំ</option>
+                <option value="bottom-left">↙ ក្រោម-ឆ្វេង</option>
+                <option value="custom">✥ អូសដោយដៃ</option>
+              </select>
+              <label class="mask-slider" title="កែតម្រូវទំហំ Sponsor (%)"><span>ទំហំ</span><input type="range" id="sponsorScaleSlider" min="8" max="55" value="26" oninput="updateSponsorScale(this.value)"></label>
+              <label class="mask-slider" title="កែតម្រូវភាពច្បាស់ Sponsor (%)"><span>ច្បាស់</span><input type="range" id="sponsorOpacitySlider" min="20" max="100" value="100" oninput="updateSponsorOpacity(this.value)"></label>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="status-badge-bar">
+        <span style="color: #10b981;">🟢</span>
+        <span id="bottomStatusMsg">ប្រព័ន្ធសំឡេង៖ Edge-TTS Neural (Piseth & Sreymom)។</span>
+      </div>
+    </div>
+
+    <!-- Right: Subtitle & Dubbing Script Table -->
+    <div class="script-section">
+      <!-- Compact Action & Language Bar -->
+      <div class="script-header-bar">
+        <div class="engine-dropdown-group">
+          <label for="sourceLangSelect">ពី</label>
+          <select id="sourceLangSelect" class="mini-select">
+            <option value="auto" selected>🌐 Auto</option>
+            <option value="zh">🇨🇳 ចិន</option>
+            <option value="en">🇬🇧 អង់គ្លេស</option>
+            <option value="th">🇹🇭 ថៃ</option>
+            <option value="vi">🇻🇳 វៀតណាម</option>
+            <option value="ko">🇰🇷 កូរ៉េ</option>
+            <option value="ja">🇯🇵 ជប៉ុន</option>
+            <option value="km">🇰🇭 ខ្មែរ</option>
+          </select>
+          <label for="targetLangSelect">→</label>
+          <select id="targetLangSelect" class="mini-select">
+            <option value="km" selected>🇰🇭 ខ្មែរ</option>
+            <option value="en">🇬🇧 English</option>
+            <option value="th">🇹🇭 ថៃ</option>
+            <option value="vi">🇻🇳 វៀតណាម</option>
+            <option value="zh">🇨🇳 ចិន</option>
+            <option value="ko">🇰🇷 កូរ៉េ</option>
+            <option value="ja">🇯🇵 ជប៉ុន</option>
+            <option value="zh-km">ចិន + ខ្មែរ</option>
+            <option value="en-km">អង់គ្លេស + ខ្មែរ</option>
+          </select>
+        </div>
+        <div class="script-ai-actions-row" style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+          <button id="btnOneClickAuto" class="btn-transcribe" onclick="runAutoOneClickPipeline()" style="background:linear-gradient(135deg, #f59e0b, #ec4899); color:#fff; box-shadow:0 3px 12px rgba(236,72,153,0.28);" title="ស្ដាប់សំឡេង + បកប្រែ + បង្កើតសំឡេង + កាត់ BGM ស្វ័យប្រវត្តិ">⚡ ១-Click Auto</button>
+          <button class="action-icon-btn speech-action" onclick="startSpeechDetection()" title="ស្ដាប់សំឡេង AI បង្កើត Subtitle">🎙️ ស្ដាប់ AI</button>
+          <button class="btn-transcribe" onclick="startAiTranslation()" title="បកប្រែ Subtitle">🌐 បកប្រែ</button>
+          <button class="action-icon-btn green voice-generation-action" onclick="batchGenerateAllAudio()" title="បង្កើតសំឡេង AI Dubbing គ្រប់បន្ទាត់">🗣️ សំឡេង</button>
+          <button class="action-icon-btn" id="btnQuickBgm" onclick="toggleRemoveVocals()" title="បំបែកភ្លេង BGM សុទ្ធ">🎵 BGM</button>
+          <label style="display:inline-flex; align-items:center; gap:4px; font-size:11px; color:#94a3b8; cursor:pointer; user-select:none;" title="ពេលបកប្រែចប់ បង្កើតសំឡេង Dubbing បន្តដោយស្វ័យប្រវត្តិ">
+            <input type="checkbox" id="autoChainDubCheck" checked style="accent-color:#10b981;">
+            <span>+សំឡេង</span>
+          </label>
+          <details class="secondary-tools-menu">
+            <summary class="secondary-toggle">OCR ▾</summary>
+            <div class="secondary-tools-panel">
+              <button class="action-icon-btn ocr-action" onclick="startSubtitleOcr()">🈶 ចាប់អក្សរពីវីដេអូ</button>
+              <label class="ocr-setting" title="តំបន់ subtitle">
+                <span>តំបន់</span>
+                <select id="ocrScanRegion" class="mini-select">
+                  <option value="subtitle" selected>តំបន់អក្សរ Subtitle</option>
+                  <option value="full">ស៊ុមទាំងមូល</option>
+                </select>
+              </label>
+              <label class="ocr-setting" title="ចន្លោះពេលស្កេន frame">
+                <span>ចន្លោះ</span>
+                <select id="ocrIntervalSelect" class="mini-select">
+                  <option value="0.5">0.5s</option>
+                  <option value="1" selected>1s</option>
+                  <option value="2">2s</option>
+                </select>
+              </label>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <!-- Compact Filter & Cast Bar -->
+      <div class="script-filter-bar">
+        <div class="script-actions-primary">
+          <label class="script-search" for="scriptSearch">🔍 <input type="text" id="scriptSearch" placeholder="ស្វែងរក subtitle..." oninput="filterTable()"></label>
+          <select id="scriptStatusFilter" class="mini-select" onchange="filterTable()" title="ច្រោះបន្ទាត់ Subtitle">
+            <option value="all" selected>📋 ទាំងអស់</option>
+            <option value="unvoiced">⚪ ខ្វះសំឡេង</option>
+            <option value="untranslated">🌐 មិនទាន់បកប្រែ</option>
+          </select>
+          <select id="defaultVoiceSelect" class="mini-select" onchange="onDefaultVoiceChange(this.value)" title="បញ្ជីសំឡេង — រើស ១ ប្រើសម្រាប់សំឡេងទាំងអស់">
+            <option value="Sovereign King">🎙️ ពិសិទ្ធ · បុរសធម្មតា (Piseth)</option>
+            <option value="Radiant Queen">🎙️ ស្រីមុំ · ស្ត្រីធម្មតា (Sreymom)</option>
+            <option value="kh_narrator_fast">⚡ និទានរឿង TikTok (លឿន)</option>
+            <option value="kh_young_man">🧑 យុវជន (ក្មេង ស្រស់ថ្លា)</option>
+            <option value="kh_deep_boss">🧔 លោកប្រធាន / លោកតា (ធ្ងន់)</option>
+            <option value="kh_young_girl">👧 យុវតី / ក្មេងស្រី (ស្រស់ស្រាយ)</option>
+            <option value="kh_child">🧒 កូនក្មេង (តូច គួរឲ្យស្រឡាញ់)</option>
+            <option value="kh_elder_woman">👵 ម្តាយ / លោកយាយ (ធ្ងន់ ស្ងប់)</option>
+          </select>
+          <button type="button" class="action-icon-btn" onclick="openVoiceCloneModal()" style="border-color:rgba(168,85,247,0.5); color:#e9d5ff; background:rgba(147,51,234,0.14);" title="បង្កើត និងគ្រប់គ្រងសំឡេង Clone">🎭 Clone</button>
+          <button class="action-icon-btn voice-generation-action" onclick="batchGenerateAllAudio({ onlyMissing: true })" style="border-color:rgba(56,189,248,0.45); color:#bae6fd; background:rgba(14,165,233,0.12);" title="បង្កើតសំឡេងតែបន្ទាត់ដែលនៅខ្វះ">🔄 តែខ្វះ</button>
+          <details class="script-edit-menu">
+            <summary class="secondary-toggle">កែ Subtitle</summary>
+            <div class="project-menu-panel script-edit-panel">
+              <button class="action-icon-btn" onclick="addNewCueLine()">＋ បន្ថែមបន្ទាត់</button>
+              <button class="action-icon-btn" onclick="saveSrtToDisk()">💾 រក្សាទុក SRT</button>
+              <button class="action-icon-btn danger" onclick="deleteSelectedCue()">លុបបន្ទាត់</button>
+              <button class="action-icon-btn danger" onclick="clearAllCues()">🗑️ សម្អាតទាំងអស់</button>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <!-- The Table -->
+      <div class="script-table-container">
+        <table class="script-table">
+          <thead>
+            <tr>
+              <th style="width: 32px;"><input type="checkbox" id="selectAllCheck" onclick="toggleSelectAll(this)"></th>
+              <th style="width: 70px;">ចាប់ផ្ដើម</th>
+              <th style="width: 70px;">បញ្ចប់</th>
+              <th>អត្ថបទ Subtitle</th>
+              <th style="width: 175px;">សំឡេង</th>
+              <th style="width: 68px; text-align: center;">ស្តាប់</th>
+            </tr>
+          </thead>
+          <tbody id="cuesTableBody">
+            <!-- Dynamic Rows -->
+          </tbody>
+        </table>
+      </div>
+
+      <div class="script-legend" style="background: #080d19; border-top: 1px solid var(--border); padding: 5px 14px; font-size: 11px; display: flex; justify-content: space-between; align-items: center; color: #64748b;">
+        <div style="display: flex; gap: 14px;">
+          <span style="color: #10b981;">🟢 មានសំឡេង</span>
+          <span style="color: #94a3b8;">⚪ មិនទាន់បង្កើតសំឡេង</span>
+        </div>
+        <div id="cuesStatsText">សរុប: 0 បន្ទាត់</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Bottom Multi-Track Timeline -->
+  <div class="timeline-dock">
+    <div class="timeline-viewport">
+      <div class="timeline-header-controls">
+        <div class="timeline-actions-left">
+          <span class="badge-blue" id="voiceReadyBadge">0/0 ready</span>
+          <span class="timeline-hint">សំឡេងរួចរាល់</span>
+          <details class="timeline-edit-menu">
+            <summary class="secondary-toggle">កែ Timeline</summary>
+            <div class="timeline-edit-panel">
+              <button class="top-btn" onclick="renderTimeline()">ធ្វើបច្ចុប្បន្នភាព</button>
+              <button class="top-btn" onclick="splitLineAtCurrentTime()">កាត់បន្ទាត់</button>
+              <button class="top-btn" onclick="nudgeActiveCue(-0.5)">ថយ 0.5s</button>
+              <button class="top-btn" onclick="nudgeActiveCue(0.5)">ទៅមុខ 0.5s</button>
+            </div>
+          </details>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px;">
+          <span style="font-size: 10px; color: #64748b;">Zoom:</span>
+          <input type="range" id="timelineZoom" min="1" max="4" value="1" style="width: 70px;" oninput="renderTimeline()">
+        </div>
+      </div>
+
+      <div class="tracks-container" id="tracksContainer" onclick="seekByTimeline(event)">
+        <!-- Ruler -->
+        <div class="timeline-ruler" id="timelineRuler"></div>
+        <!-- Playhead Needle -->
+        <div id="playheadNeedle" class="playhead-needle" data-time="0:00.0"></div>
+
+        <!-- Track 1: Video Filmstrip -->
+        <div class="track-row" style="background: rgba(2, 132, 199, 0.08);">
+          <div class="track-label" style="color: #7dd3fc;">
+            <span style="color: #0284c7;">🔵</span> Video
+          </div>
+          <div class="video-filmstrip-bar" id="trackVideoBar">
+            <span class="video-title-tag" id="videoTrackTitle">មិនទាន់មានវីដេអូ</span>
+          </div>
+        </div>
+
+        <!-- Track 2: Dub / Voice -->
+        <div class="track-row" style="background: rgba(16, 185, 129, 0.08);">
+          <div class="track-label" style="color: #6ee7b7;">
+            <span style="color: #10b981;">🟢</span> Dub Voice
+          </div>
+          <div id="trackDubBlocks" style="flex: 1; height: 16px; position: relative;"></div>
+        </div>
+
+        <!-- Track 3: Subtitles -->
+        <div class="track-row" style="background: rgba(245, 158, 11, 0.08);">
+          <div class="track-label" style="color: #fde68a;">
+            <span style="color: #f59e0b;">🟡</span> Subtitles
+          </div>
+          <div id="trackSubBlocks" style="flex: 1; height: 16px; position: relative;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+      </div><!-- /#studioViewPane -->
+
+      <!-- Multi-Video Batch Manager Workspace Pane -->
+      <div id="videoManagerModal" class="vm-workspace-pane" style="display:none;">
+        <div class="modal-card vm-modal-card">
+          <div class="modal-title">
+            <span>⚡ Video Manager · បកប្រែ + សំឡេងច្រើនវីដេអូព្រមគ្នា</span>
+            <button class="modal-close" type="button" onclick="closeVideoManagerModal()" title="ត្រឡប់ទៅ Studio">✕</button>
+          </div>
+
+          <div class="vm-toolbar">
+            <button type="button" class="top-btn source-folder-btn" onclick="pickBatchVideoFiles()">🎬 បន្ថែមវីដេអូច្រើន</button>
+            <button type="button" class="top-btn" onclick="pickBatchVideoFolder()">📁 ផ្ទុកពី Folder</button>
+            <button type="button" class="top-btn" onclick="loadCurrentDramaIntoVideoManager()">📂 ពីរឿងបច្ចុប្បន្ន</button>
+            <button type="button" id="vmExportDirBtn" class="top-btn" onclick="pickExportOutputFolder()" title="រើស Folder រក្សាទុក MP4 ពេល Auto Export">📁 ទីតាំង MP4: លំនាំដើម</button>
+            <button type="button" class="top-btn" onclick="toggleSelectAllVideoManager()">☑️ ធីក/ដោះទាំងអស់</button>
+            <button type="button" class="top-btn" style="color:#fca5a5; border-color:rgba(239,68,68,0.35);" onclick="clearVideoManagerQueue()">🗑️ លាងបញ្ជី</button>
+          </div>
+
+          <div class="vm-config-bar">
+            <label class="vm-field">ពី
+              <select id="vmSourceLangSelect" class="mini-select">
+                <option value="auto" selected>🌐 Auto</option>
+                <option value="zh">🇨🇳 ចិន</option>
+                <option value="en">🇬🇧 English</option>
+                <option value="th">🇹🇭 ថៃ</option>
+                <option value="vi">🇻🇳 វៀតណាម</option>
+                <option value="ko">🇰🇷 កូរ៉េ</option>
+                <option value="ja">🇯🇵 ជប៉ុន</option>
+              </select>
+            </label>
+            <label class="vm-field">→
+              <select id="vmTargetLangSelect" class="mini-select">
+                <option value="km" selected>🇰🇭 ខ្មែរ</option>
+                <option value="en">🇬🇧 English</option>
+                <option value="th">🇹🇭 ថៃ</option>
+                <option value="vi">🇻🇳 វៀតណាម</option>
+                <option value="zh">🇨🇳 ចិន</option>
+              </select>
+            </label>
+            <select id="vmDefaultVoiceSelect" class="mini-select" onchange="onDefaultVoiceChange(this.value)" title="បញ្ជីសំឡេង — រើស ១ ប្រើសម្រាប់វីដេអូទាំងអស់">
+              <option value="Sovereign King">🎙️ ពិសិទ្ធ · បុរសធម្មតា (Piseth)</option>
+              <option value="Radiant Queen">🎙️ ស្រីមុំ · ស្ត្រីធម្មតា (Sreymom)</option>
+              <option value="kh_narrator_fast">⚡ និទានរឿង TikTok (លឿន)</option>
+              <option value="kh_young_man">🧑 យុវជន (ក្មេង ស្រស់ថ្លា)</option>
+              <option value="kh_deep_boss">🧔 លោកប្រធាន / លោកតា (ធ្ងន់)</option>
+              <option value="kh_young_girl">👧 យុវតី / ក្មេងស្រី (ស្រស់ស្រាយ)</option>
+              <option value="kh_child">🧒 កូនក្មេង (តូច គួរឲ្យស្រឡាញ់)</option>
+              <option value="kh_elder_woman">👵 ម្តាយ / លោកយាយ (ធ្ងន់ ស្ងប់)</option>
+            </select>
+            <button type="button" class="action-icon-btn" onclick="openVoiceCloneModal()" style="border-color:rgba(168,85,247,0.5); color:#e9d5ff; background:rgba(147,51,234,0.14);" title="បង្កើត និងគ្រប់គ្រងសំឡេង Clone">🎭 Clone</button>
+            <label class="vm-field" title="ចំនួនវីដេអូដំណើរការព្រមគ្នាក្នុងពេលតែមួយ">⚡ ព្រមគ្នា
+              <select id="vmConcurrencySelect" class="mini-select">
+                <option value="2">x2 វីដេអូ</option>
+                <option value="3">x3 វីដេអូ</option>
+                <option value="4" selected>x4 លឿន</option>
+                <option value="6">x6 Max!</option>
+              </select>
+            </label>
+            <label class="vm-check"><input type="checkbox" id="vmGenerateTtsCheck" checked><span>🗣️ បង្កើតសំឡេង</span></label>
+            <label class="vm-check"><input type="checkbox" id="vmSaveDraftCheck" checked><span>💾 SRT & Draft</span></label>
+            <label class="vm-check"><input type="checkbox" id="vmIsolateBgmCheck"><span>🎵 BGM</span></label>
+            <label class="vm-check"><input type="checkbox" id="vmAutoExportCheck"><span>🎬 Auto Export MP4</span></label>
+            <div class="vm-run-actions">
+              <button type="button" id="btnVmStart" class="btn-export" onclick="startVideoManagerBatch()">🚀 ចាប់ផ្ដើម Auto ទាំងអស់</button>
+              <button type="button" id="btnVmStop" class="top-btn" onclick="stopVideoManagerBatch()" style="display:none; border-color:#ef4444; color:#fca5a5;">⏹️ បញ្ឈប់</button>
+            </div>
+          </div>
+
+          <div class="vm-progress-head">
+            <span id="vmProgressSummary">ជ្រើសវីដេអូ ឬ Folder ដើម្បីចាប់ផ្ដើម Auto បកប្រែ + សំឡេងច្រើនព្រមគ្នា</span>
+            <span id="vmProgressCount">0 / 0</span>
+          </div>
+          <div class="vm-progress-track">
+            <div id="vmProgressFill" class="vm-progress-fill" style="width:0%;"></div>
+          </div>
+
+          <div id="vmQueueContainer" class="vm-queue-container">
+            <div class="vm-empty">មិនទាន់មានវីដេអូក្នុងបញ្ជីទេ។ ចុច "🎬 បន្ថែមវីដេអូច្រើន" ឬ "📁 ផ្ទុកពី Folder" ខាងលើ។</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Router Management Workspace Pane -->
+      <aside id="routerSidebar" class="router-sidebar router-workspace-pane" aria-labelledby="routerSidebarTitle" role="region" hidden>
+        <div class="router-sidebar-header">
+          <div class="router-header-title-wrap">
+            <span class="router-header-badge">⚡</span>
+            <div>
+              <h2 id="routerSidebarTitle">EZA PRO Router</h2>
+              <p>គ្រប់គ្រង Gemini API Pool, ផ្អាក/បើក Key និងស្ថានភាពបកប្រែផ្ទាល់</p>
+            </div>
+            <span id="routerSidebarStatus" class="router-sidebar-status" role="status" aria-live="polite"></span>
+          </div>
+          <div class="router-header-actions">
+            <button id="routerToggleAddBtn" class="router-header-btn primary" type="button" onclick="toggleRouterAddPanel()">＋ បន្ថែម ១ Key</button>
+            <button id="routerToggleBatchBtn" class="router-header-btn" type="button" onclick="toggleRouterBatchPanel()" title="បិទភ្ជាប់ API Key ច្រើនព្រមគ្នា">📥 បញ្ចូលច្រើន</button>
+            <button id="routerTestAllBtn" class="router-header-btn" type="button" onclick="testAllGeminiAccounts()" title="តេស្តល្បឿន និង Quota គ្រប់ Key ដែលបើកព្រមគ្នា">⚡ តេស្តទាំងអស់</button>
+            <button id="routerResetCooldownBtn" class="router-header-btn" type="button" onclick="resetRouterCooldowns()" title="សម្អាតស្ថានភាព 429 Cooldown ទាំងអស់ភ្លាមៗ">🧹 លាង 429</button>
+            <button id="routerLockUserBtn" class="router-header-btn" type="button" onclick="lockRouterForUserMode()" title="លាក់ផ្ទាំង Router ពី User ធម្មតា (ចុចផ្លាក PRO ៥ ដង ឬ Ctrl+Shift+R ដើម្បីបើកវិញ)">🔒 លាក់ពី User</button>
+            <button class="router-header-btn" type="button" onclick="refreshGeminiAccounts()" title="ធ្វើបច្ចុប្បន្នភាពស្ថានភាព">🔄</button>
+            <button class="modal-close" type="button" onclick="closeRouterSidebar()" aria-label="ត្រឡប់ទៅ Studio">✕</button>
+          </div>
+        </div>
+
+        <div id="routerTelemetryDock" class="router-telemetry-dock" aria-live="polite"></div>
+        <div id="routerAccountsList" class="router-accounts-list" aria-live="polite"></div>
+
+        <div id="routerAddPanel" class="router-add-panel" hidden>
+          <div class="router-add-header">
+            <span id="routerAddTitle">＋ បន្ថែម Gemini Account ថ្មី</span>
+            <button class="router-add-close" type="button" onclick="toggleRouterAddPanel(false)" aria-label="បិទទម្រង់បន្ថែម">✕</button>
+          </div>
+          <form id="routerAddForm" class="router-add-form" onsubmit="addGeminiAccount(event)">
+            <input name="accountId" type="hidden" value="">
+            <label>ឈ្មោះ Account
+              <input name="name" type="text" placeholder="ឧ. Kook / Pro Account" maxlength="80" autocomplete="off" required>
+            </label>
+            <label>Email (មិនបាច់ក៏បាន)
+              <input name="email" type="email" placeholder="example@gmail.com" maxlength="254" autocomplete="email">
+            </label>
+            <label>Gemini API Key <span id="routerKeyOptionalHint" class="router-field-hint" hidden>(ទុកទំនេរ បើមិនប្ដូរ Key ចាស់)</span>
+              <div class="router-key-input-wrap">
+                <input id="routerApiKeyInput" name="apiKey" type="password" placeholder="AIza... ឬ AQ..." minlength="20" maxlength="512" autocomplete="new-password" required>
+                <button id="routerKeyEyeBtn" class="router-key-eye-btn" type="button" onclick="toggleRouterKeyVisibility()" title="បង្ហាញ / លាក់ API Key" aria-label="បង្ហាញ API Key">👁️</button>
+              </div>
+            </label>
+            <div class="router-add-footer">
+              <button class="top-btn" type="button" onclick="toggleRouterAddPanel(false)">បោះបង់</button>
+              <button id="routerAddSubmitBtn" class="btn-export" type="submit">💾 រក្សាទុក និងដាក់ឲ្យសកម្ម</button>
+            </div>
+          </form>
+        </div>
+
+        <div id="routerBatchPanel" class="router-add-panel router-batch-panel" hidden>
+          <div class="router-add-header">
+            <span>📥 បញ្ចូល Gemini API Key ច្រើនព្រមគ្នា</span>
+            <button class="router-add-close" type="button" onclick="toggleRouterBatchPanel(false)" aria-label="បិទទម្រង់បញ្ចូលច្រើន">✕</button>
+          </div>
+          <form id="routerBatchForm" class="router-add-form" onsubmit="submitBatchGeminiKeys(event)">
+            <label>បិទភ្ជាប់ Key ១ ក្នុង ១ បន្ទាត់ (អាចដាក់ជា "ឈ្មោះ | Key" ឬតែ Key សុទ្ធ)
+              <textarea id="routerBatchInput" rows="6" placeholder="Key 1 | AIzaSy...&#10;Key 2 | AIzaSy...&#10;AIzaSy..." required></textarea>
+            </label>
+            <label class="router-batch-check">
+              <input type="checkbox" id="routerBatchAutoTestCheck" checked>
+              <span>⚡ តេស្តសុខភាព Key ទាំងអស់ភ្លាមៗក្រោយរក្សាទុក</span>
+            </label>
+            <div class="router-add-footer">
+              <button class="top-btn" type="button" onclick="toggleRouterBatchPanel(false)">បោះបង់</button>
+              <button id="routerBatchSubmitBtn" class="btn-export" type="submit">📥 បញ្ចូល Key ទាំងអស់</button>
+            </div>
+          </form>
+        </div>
+      </aside>
+    </main>
+  </div><!-- /.app-shell -->
+
+  <!-- Drama Picker Modal -->
+  <div id="dramaPickerModal" class="modal-overlay">
+    <div class="modal-card" style="width: 640px;">
+      <div class="modal-title">
+        <span>📂 ជ្រើសរើសរឿងពី D:\HDRG</span>
+        <button class="modal-close" onclick="closeHdrgDramaPicker()">✕</button>
+      </div>
+      <div id="dramaListContainer" style="max-height: 340px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+        <div style="color: #64748b; text-align: center; padding: 20px;">⏳ កំពុងស្កេន Folder...</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="draftsModal" class="modal-overlay" style="display:none;">
+    <div class="modal-card drafts-modal-card">
+      <div class="modal-title">
+        <span>📋 Saved Drafts</span>
+        <button class="modal-close" onclick="closeDraftsModal()">✕</button>
+      </div>
+      <div class="drafts-toolbar">
+        <span>រក្សាទុក និងស្ដារការងារតាមវីដេអូ</span>
+        <button class="top-btn" onclick="refreshDraftsList()">🔄 Refresh</button>
+      </div>
+      <div id="draftsListContainer" class="drafts-list-container" aria-live="polite">
+        <div class="drafts-empty">⏳ កំពុងផ្ទុក drafts...</div>
+      </div>
+      <div class="drafts-footer">
+        <button class="top-btn" onclick="closeDraftsModal()">បិទ</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Modal -->
+  <div id="exportModal" class="modal-overlay">
+    <div class="modal-card export-modal-card">
+      <div class="modal-title">
+        <span>✨ EXPORT PROJECT (នាំចេញគម្រោង)</span>
+        <button class="modal-close" onclick="closeExportModal()">✕</button>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 10px;">
+        <div class="export-section-card export-srt-card">
+          <div>
+            <div style="font-size: 13px; font-weight: 700; color: #fff;">📝 Export File អក្សររត់ .SRT</div>
+            <div style="font-size: 11px; color: #94a3b8;">រក្សាទុកអក្សររត់ .SRT ដែលបានបកប្រែ និងកែសម្រួលរួច</div>
+          </div>
+          <button type="button" class="btn-export" onclick="downloadSrtFile()">💾 រក្សាទុក .SRT</button>
+        </div>
+
+        <div class="export-section-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+            <div>
+              <div style="font-size: 13px; font-weight: 700; color: #fff;">🎬 Export វីដេអូ HD + AI Dubbing (.MP4)</div>
+              <div id="exportPreviewSummary" class="export-preview-summary">ស្ទីល៖ TikTok Gold · ផ្ទៃបាំង៖ បិទ (ប្រើតាម Player Preview)</div>
+            </div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <button id="btnCancelExport" class="top-btn" onclick="cancelActiveExport()" style="display:none; border-color:#ef4444; color:#fca5a5;">🛑 បោះបង់</button>
+              <button id="btnStartExport" class="btn-export" onclick="exportVideoWithFfmpeg()">🚀 Export MP4</button>
+            </div>
+          </div>
+
+          <div class="export-row">
+            <label class="export-field">
+              <span>🔊 សំឡេង៖</span>
+              <select id="exportAudioMode" class="mini-select" style="padding:4px 8px; font-size:11px;" onchange="syncExportDubControls()">
+                <option value="bgm_only" selected>🎵 ភ្លេង BGM សុទ្ធ + AI Dubbing (បំបាត់សំឡេងដើម)</option>
+                <option value="duck">🔉 បន្ថយសំឡេងដើមពេលនិយាយ + AI Dubbing</option>
+                <option value="bg_low">🔉 សំឡេងដើមតិចៗ 18% + AI Dubbing</option>
+                <option value="dub_only">🗣️ ឮតែ AI Dubbing សុទ្ធ 100% (បិទសំឡេងដើម)</option>
+                <option value="original">🔇 រក្សាសំឡេងដើម (គ្មានសំឡេង Dubbing)</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="export-row export-dir-row" id="exportLogoRow">
+            <label style="display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:700; color:#e2e8f0; cursor:pointer; white-space:nowrap;" title="ដាក់រូប Logo លើវីដេអូ ឬមិនដាក់ក៏បាន">
+              <input type="checkbox" id="exportLogoCheck" onchange="toggleLogoOverlay(this.checked)">
+              <span>🖼️ Logo៖</span>
+            </label>
+            <img id="exportLogoThumbImg" class="sponsor-mini-thumb" alt="" hidden>
+            <video id="exportLogoThumbVideo" class="sponsor-mini-thumb" autoplay loop muted playsinline hidden></video>
+            <input type="text" id="exportLogoFileInput" class="export-dir-input" style="cursor:pointer;" onclick="pickLogoOverlayFile()" readonly value="" placeholder="មិនដាក់ (Optional)">
+            <select id="exportLogoPosSelect" class="mini-select" style="padding:3px 6px; font-size:11px;" onchange="changeLogoPosition(this.value)">
+              <option value="top-right" selected>↗ លើ-ស្ដាំ</option>
+              <option value="top-left">↖ លើ-ឆ្វេង</option>
+              <option value="top-center">↑ លើ-កណ្តាល</option>
+              <option value="bottom-right">↘ ក្រោម-ស្ដាំ</option>
+              <option value="bottom-left">↙ ក្រោម-ឆ្វេង</option>
+              <option value="bottom-center">↓ ក្រោម-កណ្តាល</option>
+              <option value="custom">✥ អូសដោយដៃ</option>
+            </select>
+            <button type="button" id="btnChooseExportLogo" class="top-btn" onclick="pickLogoOverlayFile()">🖼️ រើស Logo...</button>
+            <button type="button" id="btnExportClearLogo" class="top-btn" onclick="clearLogoOverlayFile()" title="ដក Logo ចេញ" hidden>✕</button>
+          </div>
+
+          <div class="export-row export-dir-row" id="exportSponsorRow">
+            <label style="display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:700; color:#e2e8f0; cursor:pointer; white-space:nowrap;" title="ដាក់វីដេអូ Sponsor លើវីដេអូ ឬមិនដាក់ក៏បាន">
+              <input type="checkbox" id="exportSponsorCheck" onchange="toggleSponsorOverlay(this.checked)">
+              <span>🎬 Sponsor៖</span>
+            </label>
+            <img id="exportSponsorThumbImg" class="sponsor-mini-thumb" alt="" hidden>
+            <video id="exportSponsorThumbVideo" class="sponsor-mini-thumb" autoplay loop muted playsinline hidden></video>
+            <input type="text" id="exportSponsorFileInput" class="export-dir-input" style="cursor:pointer;" onclick="pickSponsorOverlayFile()" readonly value="" placeholder="មិនដាក់ (Optional)">
+            <select id="exportSponsorPosSelect" class="mini-select" style="padding:3px 6px; font-size:11px;" onchange="changeSponsorPosition(this.value)">
+              <option value="bottom-center" selected>↓ ក្រោម-កណ្តាល</option>
+              <option value="top-right">↗ លើ-ស្ដាំ</option>
+              <option value="top-left">↖ លើ-ឆ្វេង</option>
+              <option value="top-center">↑ លើ-កណ្តាល</option>
+              <option value="bottom-right">↘ ក្រោម-ស្ដាំ</option>
+              <option value="bottom-left">↙ ក្រោម-ឆ្វេង</option>
+              <option value="custom">✥ អូសដោយដៃ</option>
+            </select>
+            <button type="button" id="btnChooseExportSponsor" class="top-btn" onclick="pickSponsorOverlayFile()">🎬 រើស Sponsor...</button>
+            <button type="button" id="btnExportClearSponsor" class="top-btn" onclick="clearSponsorOverlayFile()" title="ដក Sponsor ចេញ" hidden>✕</button>
+          </div>
+
+          <div class="export-row export-dir-row">
+            <span class="export-dir-label">📁 រក្សាទុកនៅ៖</span>
+            <input type="text" id="exportOutputDirInput" class="export-dir-input" readonly value="" placeholder="Exported\">
+            <button type="button" id="btnChooseExportDir" class="top-btn" onclick="pickExportOutputFolder()">📁 រើស Folder...</button>
+            <button type="button" id="btnResetExportDir" class="top-btn" onclick="resetExportOutputFolder()" title="ត្រឡប់ទៅ Folder លំនាំដើមវិញ" hidden>↺</button>
+            <button type="button" id="btnOpenExportDir" class="top-btn" onclick="openExportFolder()" title="បើក Folder ក្នុង Windows Explorer">📂 បើក</button>
+          </div>
+
+          <details id="exportAdvancedDetails" class="export-advanced-details">
+            <summary>⚙️ កំណត់កម្រិតខ្ពស់ (ទំហំ, គុណភាព, Encoder)</summary>
+            <div class="export-advanced-grid">
+              <label class="export-field">
+                <span>📺 កម្រិតរូបភាព</span>
+                <select id="exportResolution" class="mini-select" style="padding:3px 6px; font-size:10.5px;">
+                  <option value="source" selected>ទំហំដើម (Original)</option>
+                  <option value="1080p">Full HD 1080p</option>
+                  <option value="720p">HD 720p</option>
+                  <option value="4k">Ultra HD 4K</option>
+                </select>
+              </label>
+              <label class="export-field">
+                <span>💎 គុណភាព</span>
+                <select id="exportQualityPreset" class="mini-select" style="padding:3px 6px; font-size:10.5px;">
+                  <option value="hd" selected>HD ច្បាស់ស្អាត</option>
+                  <option value="fast">លឿនរហ័ស (Fast)</option>
+                  <option value="ultra">Ultra ច្បាស់បំផុត</option>
+                </select>
+              </label>
+              <label class="export-field">
+                <span>⚡ Encoder</span>
+                <select id="exportEncoder" class="mini-select" style="padding:3px 6px; font-size:10.5px;">
+                  <option value="auto" selected>ស្វ័យប្រវត្តិ (GPU/CPU)</option>
+                  <option value="cpu">CPU (libx264)</option>
+                </select>
+              </label>
+              <label id="exportAutoFitWrap" class="export-field" style="cursor:pointer;">
+                <input type="checkbox" id="exportAutoFitCheck" checked>
+                <span>⚡ កែល្បឿនកុំឲ្យជាន់គ្នា</span>
+              </label>
+              <span id="exportGpuBadge" style="font-size:10.5px; color:#38bdf8;"></span>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div id="exportProgressTrack" class="export-progress-track" hidden>
+        <div id="exportProgressFill" class="export-progress-fill" style="width:0%;"></div>
+      </div>
+      <div class="export-status-footer">
+        <div id="exportStatusMsg" style="font-size: 12px; color: #38bdf8; min-height: 20px; flex:1;"></div>
+        <button type="button" id="btnDownloadExportedMp4" class="btn-export" style="padding:5px 12px; font-size:11px;" onclick="downloadLastExportedFile()" hidden>⬇️ ទាញយក MP4</button>
+        <button type="button" id="btnOpenExportedFile" class="top-btn" onclick="openLastExportedLocation()" hidden>📂 បើកទីតាំង File</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Voice Clone Studio Modal -->
+  <div id="voiceCloneModal" class="modal-overlay" style="display:none;">
+    <div class="modal-card" style="max-width: 680px; width: 94%; max-height: 88vh; overflow-y: auto; gap: 12px;">
+      <div class="modal-title">
+        <span>🎭 Voice Clone Studio (Edge ខ្មែរ → Seed-VC AI)</span>
+        <button type="button" class="modal-close" onclick="closeVoiceCloneModal()">✕</button>
+      </div>
+
+      <!-- Engine Install & Hardware Status Card -->
+      <div style="background:#0d1526; border:1px solid var(--border-light); border-radius:8px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+          <div>
+            <div style="font-size:13px; font-weight:700; color:#e2e8f0;">⚙️ ម៉ាស៊ីន AI Voice Clone (Seed-VC fp16)</div>
+            <div id="cloneEngineHwText" style="font-size:11px; color:#94a3b8;">កំពុងពិនិត្យម៉ាស៊ីន...</div>
+          </div>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <span id="cloneEngineReadyBadge" style="font-size:11px; padding:3px 9px; border-radius:12px; background:rgba(245,158,11,0.14); color:#fcd34d; border:1px solid rgba(245,158,11,0.35);">មិនទាន់ដំឡើង</span>
+            <button type="button" id="btnInstallSeedVc" class="btn-export" style="padding:6px 12px; font-size:11px;" onclick="installSeedVcEngine()">⬇️ ដំឡើង Seed-VC (~3–4GB)</button>
+            <button type="button" id="btnCancelSeedVc" class="top-btn" style="display:none; border-color:#ef4444; color:#fca5a5; padding:5px 10px; font-size:11px;" onclick="cancelSeedVcEngine()">⏹️ បោះបង់</button>
+          </div>
+        </div>
+        <div id="cloneInstallProgressWrap" style="display:none; flex-direction:column; gap:4px;">
+          <div style="display:flex; justify-content:space-between; font-size:11px; color:#38bdf8;">
+            <span id="cloneInstallStageText">កំពុងរៀបចំ...</span>
+            <span id="cloneInstallPercentText">0%</span>
+          </div>
+          <div style="width:100%; height:6px; background:#070c17; border-radius:4px; overflow:hidden;">
+            <div id="cloneInstallBarFill" style="height:100%; width:0%; background:linear-gradient(90deg, #a855f7, #00e5c0); transition:width 0.3s;"></div>
+          </div>
+          <pre id="cloneInstallLogBox" style="margin:0; padding:6px 8px; background:#070c17; border:1px solid #1e293b; border-radius:4px; font-size:10px; color:#94a3b8; max-height:90px; overflow-y:auto; white-space:pre-wrap;"></pre>
+        </div>
+      </div>
+
+      <!-- Create New Cloned Voice Profile -->
+      <div style="background:#0d1526; border:1px solid var(--border); border-radius:8px; padding:12px; display:flex; flex-direction:column; gap:10px;">
+        <div style="font-size:13px; font-weight:700; color:#fff;">➕ បង្កើតសំឡេង Clone ថ្មី (ប្រើសំឡេងគំរូស្អាត 5–20 វិនាទី)</div>
+        <div style="display:grid; grid-template-columns: 1fr 180px; gap:8px;">
+          <input type="text" id="cloneVoiceNameInput" placeholder="ឈ្មោះសំឡេង (ឧ. តួឯកស្រី / ពិធីករ A)..." style="background:#070c17; border:1px solid var(--border-light); border-radius:6px; padding:8px 10px; color:#fff; font-size:12px; outline:none;">
+          <select id="cloneVoiceGenderSelect" class="mini-select" style="width:100%;" title="សំឡេងដើមសម្រាប់អានភាសាខ្មែរ">
+            <option value="Male">បុរស · Edge Piseth</option>
+            <option value="Female">ស្ត្រី · Edge Sreymom</option>
+          </select>
+        </div>
+
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+          <input type="file" id="cloneAudioFileInput" accept="audio/*,.wav,.mp3,.m4a,.ogg,.webm,.mp4,.mkv" style="display:none;" onchange="handleCloneFileUpload(event)">
+          <button type="button" class="top-btn" onclick="document.getElementById('cloneAudioFileInput').click()">📁 Upload សំឡេងគំរូ (WAV/MP3/M4A)</button>
+          <button type="button" id="btnRecordCloneMic" class="top-btn" onclick="toggleCloneMicRecord()">🎙️ ថតសំឡេងតាម Mic</button>
+          <span id="cloneRecordStatusText" style="font-size:11px; color:#94a3b8;"></span>
+        </div>
+
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding-top:8px; border-top:1px solid #1a253a;">
+          <span style="font-size:11px; color:#cbd5e1;">🎬 ឬកាត់យកសំឡេងពីវីដេអូបច្ចុប្បន្ន៖</span>
+          <label style="font-size:11px; color:#94a3b8;">ចាប់ពី (s):
+            <input type="number" id="cloneVideoStartSec" value="0" min="0" step="0.5" style="width:62px; background:#070c17; border:1px solid var(--border-light); border-radius:4px; color:#fff; padding:3px 6px; font-size:11px;">
+          </label>
+          <label style="font-size:11px; color:#94a3b8;">រយៈពេល (s):
+            <input type="number" id="cloneVideoDurSec" value="12" min="3" max="25" step="1" style="width:52px; background:#070c17; border:1px solid var(--border-light); border-radius:4px; color:#fff; padding:3px 6px; font-size:11px;">
+          </label>
+          <button type="button" class="action-icon-btn" onclick="useVideoPlayheadForClone()">⏱️ យកនាទីកំពុងឈរ</button>
+          <button type="button" class="action-icon-btn green" onclick="extractCloneFromCurrentVideo()">✂️ កាត់គំរូពីវីដេអូ</button>
+        </div>
+      </div>
+
+      <!-- Saved Cloned Voices List -->
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size:12px; font-weight:700; color:#e2e8f0;">📚 បញ្ជីសំឡេង Clone ដែលបានរក្សាទុក</span>
+          <button type="button" class="top-btn" style="padding:4px 10px; font-size:11px;" onclick="refreshClonedVoicesPanel()">🔄 Refresh</button>
+        </div>
+        <div id="clonedVoicesList" style="display:flex; flex-direction:column; gap:6px; max-height:220px; overflow-y:auto;">
+          <div style="font-size:12px; color:#64748b; text-align:center; padding:14px;">មិនទាន់មានសំឡេង Clone នៅឡើយទេ</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mobile Connect & System Maintenance Hub Modal -->
+  <div id="mobileConnectModal" class="modal-overlay" style="display:none;">
+    <div class="modal-card" style="max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto; gap: 12px;">
+      <div class="modal-title">
+        <span>📱 ភ្ជាប់ទូរស័ព្ទ & គ្រប់គ្រងប្រព័ន្ធ (Mobile & Maintenance Hub)</span>
+        <button type="button" class="modal-close" onclick="closeMobileConnectModal()">✕</button>
+      </div>
+
+      <!-- Phone Wi-Fi / LAN Connection Card -->
+      <div style="background:#0d1526; border:1px solid rgba(56,189,248,0.35); border-radius:10px; padding:12px; display:flex; flex-direction:column; gap:10px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+          <div>
+            <div style="font-size:13px; font-weight:700; color:#f8fafc;">🌐 តំណភ្ជាប់សម្រាប់បើកលើទូរស័ព្ទ (Wi-Fi រួមគ្នា)</div>
+            <div style="font-size:11px; color:#94a3b8;">បើក Chrome (Android) ឬ Safari (iPhone) វាយតំណនេះ ឬស្កេន QR ខាងក្រោម</div>
+          </div>
+          <button type="button" class="btn-export" style="padding:6px 12px; font-size:11px;" onclick="copyMobileConnectUrl()">📋 ចម្លង Link</button>
+        </div>
+
+        <div style="display:flex; gap:8px; align-items:center;">
+          <input type="text" id="mobileLanUrlInput" readonly value="http://127.0.0.1:3001" style="flex:1; background:#070c17; border:1px solid var(--border-light); border-radius:6px; padding:8px 10px; color:#38bdf8; font-size:13px; font-weight:700; font-family:monospace; outline:none;">
+          <button type="button" class="top-btn" onclick="refreshSystemHubModal()" title="ពិនិត្យ IP ម្ដងទៀត">🔄</button>
+        </div>
+
+        <!-- Public Internet Tunnel Row (4G / 5G / Different Wi-Fi Anywhere) -->
+        <div style="border-top:1px solid #1e293b; padding-top:8px; display:flex; flex-direction:column; gap:6px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span style="font-size:12px; font-weight:700; color:#10b981;">🌍 ប្រើពីចម្ងាយតាម 4G / 5G / Wi-Fi ផ្សេងគ្នា (Public HTTPS Tunnel)</span>
+            <div style="display:flex; gap:6px;">
+              <button type="button" id="btnStartPublicTunnel" class="btn-export" style="padding:5px 10px; font-size:11px;" onclick="startPublicInternetLink()">🌍 បើក Link 4G/5G</button>
+              <button type="button" id="btnCopyPublicTunnel" class="top-btn" style="padding:5px 10px; font-size:11px;" onclick="copyPublicTunnelUrl()" hidden>📋 ចម្លង Link 4G/5G</button>
+              <button type="button" id="btnStopPublicTunnel" class="top-btn" style="padding:5px 8px; font-size:11px; border-color:#ef4444; color:#fca5a5;" onclick="stopPublicInternetLink()" hidden>⏹️ បិទ</button>
+            </div>
+          </div>
+          <input type="text" id="mobilePublicTunnelUrlInput" readonly placeholder="ចុច «🌍 បើក Link 4G/5G» ដើម្បីបង្កើតតំណភ្ជាប់អ៊ីនធឺណិតគ្រប់ទីកន្លែង..." onclick="this.select()" style="background:#050912; border:1px dashed rgba(16,185,129,0.45); border-radius:6px; padding:7px 10px; color:#10b981; font-size:12px; font-weight:700; font-family:monospace; outline:none;">
+        </div>
+
+        <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap; background:#080d19; border:1px solid #1e293b; border-radius:8px; padding:10px;">
+          <div id="mobileQrContainer" style="width:116px; height:116px; background:#fff; border-radius:8px; padding:6px; display:flex; align-items:center; justify-content:center; flex-shrink:0;"></div>
+          <div style="flex:1; min-width:190px; font-size:11.5px; color:#cbd5e1; line-height:1.6;">
+            <div>✅ <strong>រើសវីដេអូពីទូរស័ព្ទផ្ទាល់៖</strong> ចុច <code>🎬 Video</code> លើទូរស័ព្ទដើម្បី Upload វីដេអូពី Gallery។</div>
+            <div>✅ <strong>ទាញយក MP4 ចូលទូរស័ព្ទ៖</strong> ពេល Export ចប់ ចុច <code>⬇️ ទាញយក MP4</code>។</div>
+            <div>💡 <strong>ដាក់លើអេក្រង់ទូរស័ព្ទ៖</strong> ចុចម៉ឺនុយ Browser → <em>Add to Home Screen</em>។</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Customer Cloud License Status Card (shown when Cloud License active) -->
+      <div id="customerCloudLicenseSection" style="display:none; background:#0d1526; border:1px solid rgba(56,189,248,0.35); border-radius:10px; padding:12px; flex-direction:column; gap:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+          <div style="font-size:13px; font-weight:700; color:#38bdf8;">🎫 ស្ថានភាព License របស់អ្នក</div>
+          <button type="button" class="top-btn" style="font-size:11px;" onclick="switchCustomerLicenseKey()">🔄 ប្ដូរ License Key</button>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:8px; font-size:12px; color:#cbd5e1;">
+          <div>ឈ្មោះគណនី៖ <strong id="hubCustLicenseName" style="color:#f8fafc;">-</strong></div>
+          <div>Key៖ <code id="hubCustLicenseKey" style="color:#22d3ee;">-</code></div>
+          <div>សុពលភាព៖ <strong id="hubCustLicenseExpiry" style="color:#10b981;">-</strong></div>
+        </div>
+      </div>
+
+      <!-- Admin Maintenance, Anti-Bypass & License Generator Card -->
+      <div id="systemHubAdminSection" style="background:#0d1526; border:1px solid var(--border); border-radius:10px; padding:12px; display:flex; flex-direction:column; gap:10px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+          <div style="font-size:13px; font-weight:700; color:#fcd34d;">🔐 គ្រប់គ្រងសិទ្ធិអ្នកប្រើ, Anti-Crack & ការថែទាំ</div>
+          <button type="button" id="hubRouterLockToggleBtn" class="top-btn" style="font-size:11px;" onclick="toggleRouterLockFromHub()">🔒 លាក់ Router ពី User</button>
+        </div>
+
+        <div style="font-size:11.5px; color:#cbd5e1; background:#070c17; border:1px solid #1e293b; border-radius:6px; padding:7px 10px; display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span>🖥️ <strong>Machine HWID ម៉ាស៊ីននេះ៖</strong> <code id="hubCurrentMachineId" style="color:#38bdf8; font-weight:700;">EZA-....</code></span>
+          <span style="font-size:10.5px; color:#10b981;">🛡️ Scrypt + HMAC-SHA256 Anti-Bypass</span>
+        </div>
+
+        <label style="display:flex; align-items:center; gap:8px; font-size:12px; color:#e2e8f0; cursor:pointer;">
+          <input type="checkbox" id="hubUserAccessCheck">
+          <span>បើកសោការពារ (ទាមទារ Access Passcode ឬ License Key មុនចូលប្រើកម្មវិធី)</span>
+        </label>
+
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
+          <label style="display:flex; flex-direction:column; gap:4px; font-size:11px; color:#94a3b8;">
+            <span>🔑 លេខកូដសម្ងាត់រួម (Access Passcode)</span>
+            <input type="text" id="hubUserAccessCodeInput" placeholder="ឧ. EZA2026 (ទុកទំនេរបើរក្សាកូដចាស់)" style="background:#070c17; border:1px solid var(--border-light); border-radius:6px; padding:7px 10px; color:#fff; font-size:12px; outline:none;">
+          </label>
+          <label style="display:flex; flex-direction:column; gap:4px; font-size:11px; color:#94a3b8;">
+            <span>📢 សារជូនដំណឹងលើក្បាលកម្មវិធី (Banner)</span>
+            <input type="text" id="hubMaintenanceBannerInput" placeholder="ឧ. កំណែថ្មី v1.0 ដំណើរការលឿនជាងមុន!" style="background:#070c17; border:1px solid var(--border-light); border-radius:6px; padding:7px 10px; color:#fff; font-size:12px; outline:none;">
+          </label>
+        </div>
+
+        <!-- Built-in Hardware-Bound License Key Generator for Customers -->
+        <div style="border-top:1px solid #1e293b; padding-top:8px; display:flex; flex-direction:column; gap:6px;">
+          <div style="font-size:11.5px; font-weight:700; color:#bae6fd;">🎫 បង្កើត License Key ចងភ្ជាប់តាមម៉ាស៊ីន (Anti-Crack HWID Generator)</div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+            <input type="text" id="hubTargetMachineIdInput" placeholder="Machine ID អតិថិជន (ឧ. EZA-XXXX-XXXX-XXXX)" style="flex:1; min-width:160px; background:#070c17; border:1px solid var(--border-light); border-radius:6px; padding:6px 9px; color:#fff; font-size:11.5px; font-family:monospace; outline:none;">
+            <select id="hubLicenseDurationSelect" class="mini-select" style="height:32px;">
+              <option value="30">30 ថ្ងៃ (1 ខែ)</option>
+              <option value="90">90 ថ្ងៃ (3 ខែ)</option>
+              <option value="365">365 ថ្ងៃ (1 ឆ្នាំ)</option>
+              <option value="0" selected>Lifetime (ពេញមួយជីវិត)</option>
+            </select>
+            <button type="button" class="top-btn" onclick="generateCustomerLicenseKey()">⚡ បង្កើត Key</button>
+          </div>
+          <input type="text" id="hubGeneratedLicenseOutput" readonly placeholder="License Key ដែលបង្កើតរួចនឹងបង្ហាញនៅទីនេះ..." onclick="this.select()" style="background:#050912; border:1px dashed rgba(56,189,248,0.4); border-radius:6px; padding:6px 9px; color:#10b981; font-size:11.5px; font-family:monospace; outline:none;">
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span id="hubAdminStatusMsg" style="font-size:11.5px; color:#38bdf8;"></span>
+          <button type="button" class="btn-export" style="padding:6px 14px; font-size:11.5px;" onclick="saveSystemHubConfig()">💾 រក្សាទុកការកំណត់</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Full-Screen Anti-Bypass Access / License Lock Gate -->
+  <div id="accessGateOverlay" class="modal-overlay" style="display:none; z-index:9999; background:rgba(4,8,18,0.96);">
+    <div class="modal-card" style="max-width:420px; width:92%; text-align:center; gap:12px; border-color:rgba(56,189,248,0.45);">
+      <div style="font-size:34px;">🔐</div>
+      <div style="font-size:16px; font-weight:800; color:#f8fafc;">EZA PRO — ផ្ទៀងផ្ទាត់សិទ្ធិប្រើប្រាស់</div>
+      <div style="font-size:12px; color:#94a3b8; line-height:1.5;">
+        សូមបញ្ចូល <strong>Access Passcode</strong> ឬ <strong>License Key</strong> ដែលទទួលបានពី Admin ដើម្បីបើកប្រើកម្មវិធី។
+      </div>
+      <div style="background:#070c17; border:1px solid #1e293b; border-radius:6px; padding:6px 10px; font-size:11.5px; color:#cbd5e1; display:flex; align-items:center; justify-content:space-between; gap:8px;">
+        <span>Machine ID: <code id="gateMachineIdText" style="color:#38bdf8; font-weight:700;">EZA-....</code></span>
+        <button type="button" class="top-btn" style="padding:3px 8px; font-size:11px;" onclick="copyGateMachineId()">📋 ចម្លង ID</button>
+      </div>
+      <input type="text" id="gateAccessCodeInput" placeholder="បញ្ចូល License Key (ឧ. EZAPRO-XXXX-...)" onkeydown="if(event.key==='Enter') submitAccessGateCode()" style="background:#080d19; border:1px solid var(--border-light); border-radius:8px; padding:10px 12px; color:#fff; font-size:13.5px; text-align:center; font-family:monospace; outline:none;">
+      <div id="gateErrorMsg" style="font-size:11.5px; color:#fca5a5; min-height:16px;"></div>
+      <a id="gateDownloadLink" href="#" target="_blank" rel="noopener noreferrer" style="display:none; font-size:12px; color:#38bdf8; font-weight:700; text-decoration:underline;">⬇️ ទាញយកកំណែ Update ថ្មី</a>
+      <button type="button" class="btn-export" style="width:100%; justify-content:center; min-height:40px; font-size:13px;" onclick="submitAccessGateCode()">🔓 បើកចូលប្រើប្រាស់</button>
+    </div>
+  </div>
+
+  <script src="app.js?v=20261114c"></script>
+</body>
+</html>

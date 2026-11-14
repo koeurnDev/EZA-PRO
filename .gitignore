@@ -1,0 +1,70 @@
+# SHARK STUDIO PRO - Git Ignore Rules
+
+# Environment variables & API accounts (SENSITIVE!)
+.env
+.env.local
+.env.*.local
+.dev.vars
+cloudflare-license-worker/.dev.vars
+.gemini-accounts.json
+accounts.json
+cloud-license-state.json
+
+# Configuration files with sensitive data
+config.json
+
+# Node modules
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Audio / BGM / Translation / Voice / Upload caches
+audio_cache/*
+!audio_cache/.gitkeep
+bgm_cache/
+translation_cache/
+cloned_voices/
+uploads/
+
+# Draft files (may contain user data)
+drafts/*
+!drafts/.gitkeep
+
+# Export directory
+Exported/
+
+# Binary executables (large, keep local in tools/)
+tools/bin/*.exe
+tools/*.exe
+run-tunnel*
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Backup / legacy files
+*.bak
+*.backup
+*.old
+
+# Local admin credentials & wrangler build cache & dist builds
+cloudflare-license-worker/.admin-credentials.local.txt
+cloudflare-license-worker/.wrangler/
+*.local.txt
+dist/

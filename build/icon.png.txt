@@ -1,0 +1,17 @@
+PLACEHOLDER: App Icon
+===================
+
+សម្រាប់ production build, សូមដាក់ app icon នៅទីនេះ:
+- Windows: icon.png (256x256 or larger)
+- Mac: icon.png (512x512 or larger) or icon.icns
+- Linux: icon.png (512x512 or larger)
+
+អ្នកអាចបង្កើត icon ដោយប្រើ:
+- https://icon.kitchen/
+- Photoshop / GIMP
+- Online tools
+
+Icon Requirements:
+- Format: PNG (transparent background)
+- Size: 512x512px (recommended)
+- Content: ⚡ Lightning bolt + "EZA PRO" text
