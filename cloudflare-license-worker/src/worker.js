@@ -1,10 +1,125 @@
 import { renderAdminHtml } from './admin-ui.js';
 
-const OFFLINE_GRACE_MS = 12 * 60 * 60 * 1000;
+const OFFLINE_GRACE_MS = 48 * 60 * 60 * 1000;
+
+export const COMMERCIAL_PLANS = {
+  monthly_10: {
+    planId: 'monthly_10',
+    label: '$10 / ខែ (30 ថ្ងៃ)',
+    priceUsd: 10,
+    durationDays: 30,
+    warrantySupport: 'standard_warranty'
+  },
+  yearly_50: {
+    planId: 'yearly_50',
+    label: '$50 / ឆ្នាំ (365 ថ្ងៃ)',
+    priceUsd: 50,
+    durationDays: 365,
+    warrantySupport: 'vip_warranty'
+  },
+  quarterly_25: {
+    planId: 'quarterly_25',
+    label: '90 ថ្ងៃ (3 ខែ)',
+    priceUsd: 25,
+    durationDays: 90,
+    warrantySupport: 'standard_warranty'
+  },
+  trial_7: {
+    planId: 'trial_7',
+    label: 'សាកល្បង 7 ថ្ងៃ',
+    priceUsd: 0,
+    durationDays: 7,
+    warrantySupport: 'trial_support'
+  },
+  lifetime: {
+    planId: 'lifetime',
+    label: 'Lifetime',
+    priceUsd: 0,
+    durationDays: 0,
+    warrantySupport: 'vip_warranty'
+  }
+};
 
 let schemaReadyPromise = null;
 let cachedSigningKey = null;
 let cachedPrivateKeyStr = '';
+const verifyFailRateMap = new Map();
+const adminLoginFailMap = new Map();
+
+function pruneRateMap(map, now) {
+  if (map.size <= 500) return;
+  for (const [k, v] of map.entries()) {
+    if (!v || now > v.resetAt) map.delete(k);
+  }
+}
+
+function isRateLimited(map, key, maxCount, windowMs, now = Date.now()) {
+  if (!key) return false;
+  pruneRateMap(map, now);
+  const entry = map.get(key);
+  if (!entry || now > entry.resetAt) return false;
+  return entry.count >= maxCount;
+}
+
+function recordRateFailure(map, key, windowMs, now = Date.now()) {
+  if (!key) return;
+  pruneRateMap(map, now);
+  const entry = map.get(key);
+  if (!entry || now > entry.resetAt) {
+    map.set(key, { count: 1, resetAt: now + windowMs });
+  } else {
+    entry.count += 1;
+  }
+}
+
+export function compareSemver(verA = '1.0.0', verB = '1.0.0') {
+  const parse = (v) =>
+    String(v || '0.0.0')
+      .trim()
+      .replace(/^v/i, '')
+      .split(/[.-]/)
+      .slice(0, 3)
+      .map((n) => Number.parseInt(n, 10) || 0);
+  const a = parse(verA);
+  const b = parse(verB);
+  for (let i = 0; i < 3; i++) {
+    const av = a[i] || 0;
+    const bv = b[i] || 0;
+    if (av > bv) return 1;
+    if (av < bv) return -1;
+  }
+  return 0;
+}
+
+export function normalizePlanSpec(rawPlanId, rawDays, rawPriceUsd) {
+  const cleanId = String(rawPlanId || '').trim().toLowerCase();
+  if (COMMERCIAL_PLANS[cleanId]) {
+    const preset = COMMERCIAL_PLANS[cleanId];
+    const parsedDays = Number(rawDays);
+    const durationDays = Number.isFinite(parsedDays) && parsedDays >= 0 ? Math.round(parsedDays) : preset.durationDays;
+    const parsedPrice = Number(rawPriceUsd);
+    const priceUsd = Number.isFinite(parsedPrice) && parsedPrice >= 0 ? parsedPrice : preset.priceUsd;
+    return {
+      planId: preset.planId,
+      priceUsd,
+      durationDays,
+      warrantySupport: preset.warrantySupport
+    };
+  }
+  const days = Number.isFinite(Number(rawDays)) && Number(rawDays) >= 0 ? Math.round(Number(rawDays)) : 30;
+  if (days === 0) return { ...COMMERCIAL_PLANS.lifetime };
+  if (days === 30) return { ...COMMERCIAL_PLANS.monthly_10 };
+  if (days === 365) return { ...COMMERCIAL_PLANS.yearly_50 };
+  if (days === 90) return { ...COMMERCIAL_PLANS.quarterly_25 };
+  if (days === 7) return { ...COMMERCIAL_PLANS.trial_7 };
+  const parsedPrice = Number(rawPriceUsd);
+  return {
+    planId: 'custom',
+    priceUsd: Number.isFinite(parsedPrice) && parsedPrice >= 0 ? parsedPrice : 0,
+    durationDays: days,
+    warrantySupport: 'standard_warranty'
+  };
+}
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -142,6 +257,11 @@ async function ensureSchema(db) {
           customer_name TEXT NOT NULL DEFAULT '',
           contact TEXT NOT NULL DEFAULT '',
           app_scope TEXT NOT NULL DEFAULT 'all',
+          plan_id TEXT NOT NULL DEFAULT 'monthly_10',
+          price_usd REAL NOT NULL DEFAULT 10,
+          duration_days INTEGER NOT NULL DEFAULT 30,
+          first_activated_at INTEGER,
+          warranty_support TEXT NOT NULL DEFAULT 'standard_warranty',
           status TEXT NOT NULL DEFAULT 'active',
           max_machines INTEGER NOT NULL DEFAULT 1,
           bound_machines TEXT NOT NULL DEFAULT '[]',
@@ -172,9 +292,19 @@ async function ensureSchema(db) {
           created_at INTEGER NOT NULL
         )`
       ).run();
-      try {
-        await db.prepare("ALTER TABLE licenses ADD COLUMN app_scope TEXT NOT NULL DEFAULT 'all'").run();
-      } catch (_) {}
+      const migrations = [
+        "ALTER TABLE licenses ADD COLUMN app_scope TEXT NOT NULL DEFAULT 'all'",
+        "ALTER TABLE licenses ADD COLUMN plan_id TEXT NOT NULL DEFAULT 'monthly_10'",
+        "ALTER TABLE licenses ADD COLUMN price_usd REAL NOT NULL DEFAULT 10",
+        "ALTER TABLE licenses ADD COLUMN duration_days INTEGER NOT NULL DEFAULT 30",
+        "ALTER TABLE licenses ADD COLUMN first_activated_at INTEGER",
+        "ALTER TABLE licenses ADD COLUMN warranty_support TEXT NOT NULL DEFAULT 'standard_warranty'"
+      ];
+      for (const sql of migrations) {
+        try {
+          await db.prepare(sql).run();
+        } catch (_) {}
+      }
     })().catch((err) => {
       schemaReadyPromise = null;
       throw err;
@@ -190,6 +320,7 @@ async function loadSettingsMap(db) {
     maintenance_locked: '0',
     min_app_version: '1.0.0',
     download_url: '',
+    support_contact: 'https://t.me/ezapro_support',
     router_locked: '0'
   };
   for (const row of results || []) {
@@ -232,10 +363,26 @@ async function verifyAdminRequest(request, env) {
 
 async function handlePublicVerify(request, env) {
   await ensureSchema(env.DB);
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const now = Date.now();
+
+  if (isRateLimited(verifyFailRateMap, ip, 25, 60 * 1000, now)) {
+    return jsonResponse(
+      {
+        success: false,
+        valid: false,
+        reason: 'rate_limited',
+        error: 'បានព្យាយាមផ្ទៀងផ្ទាត់ញឹកញាប់ពេក។ សូមរង់ចាំ ១ នាទីសិន។'
+      },
+      429
+    );
+  }
+
   let body = {};
   try {
     body = await request.json();
   } catch (_) {
+    recordRateFailure(verifyFailRateMap, ip, 60 * 1000, now);
     return jsonResponse({ success: false, valid: false, error: 'ទម្រង់ទិន្នន័យមិនត្រឹមត្រូវ។' }, 400);
   }
 
@@ -244,13 +391,13 @@ async function handlePublicVerify(request, env) {
   const appId = normalizeClientAppId(body.appId);
   const appVersion = String(body.appVersion || '1.0.0').trim().slice(0, 20);
   const recordedClientTag = `${appId} v${appVersion}`.slice(0, 32);
-  const ip = request.headers.get('cf-connecting-ip') || '';
-  const now = Date.now();
 
   if (!licenseKey || licenseKey.length < 8) {
+    recordRateFailure(verifyFailRateMap, ip, 60 * 1000, now);
     return jsonResponse({ success: false, valid: false, reason: 'format', error: 'សូមបញ្ចូល License Key ឲ្យបានត្រឹមត្រូវ។' }, 400);
   }
   if (!machineId || machineId.length < 8) {
+    recordRateFailure(verifyFailRateMap, ip, 60 * 1000, now);
     return jsonResponse({ success: false, valid: false, reason: 'machine_id', error: 'មិនអាចស្គាល់ Machine ID ម៉ាស៊ីននេះបានទេ។' }, 400);
   }
 
@@ -259,7 +406,8 @@ async function handlePublicVerify(request, env) {
   const maintenanceLocked = settings.maintenance_locked === '1';
   const minAppVersion = settings.min_app_version || env.MIN_APP_VERSION || '1.0.0';
   const downloadUrl = settings.download_url || '';
-  const routerLocked = settings.router_locked === '1';
+  const supportContact = settings.support_contact || 'https://t.me/ezapro_support';
+  const routerLocked = false;
 
   if (maintenanceLocked) {
     return jsonResponse(
@@ -270,25 +418,44 @@ async function handlePublicVerify(request, env) {
         maintenanceBanner,
         maintenanceLocked: true,
         downloadUrl,
+        supportContact,
         error: maintenanceBanner || 'ប្រព័ន្ធកំពុងថែទាំបណ្ដោះអាសន្ន។ សូមព្យាយាមម្ដងទៀតបន្តិចទៀត។'
       },
       423
     );
   }
 
+  if (minAppVersion && compareSemver(appVersion, minAppVersion) < 0) {
+    return jsonResponse(
+      {
+        success: false,
+        valid: false,
+        reason: 'outdated_version',
+        minAppVersion,
+        downloadUrl,
+        supportContact,
+        error: `សូមអាប់ដេតកម្មវិធីទៅជំនាន់ថ្មី v${minAppVersion} ជាមុនសិន ដើម្បីប្រើប្រាស់បន្ត។`
+      },
+      426
+    );
+  }
+
   const row = await env.DB.prepare('SELECT * FROM licenses WHERE license_key = ?').bind(licenseKey).first();
   if (!row) {
+    recordRateFailure(verifyFailRateMap, ip, 60 * 1000, now);
     await logAudit(env.DB, { licenseKey, machineId, event: 'reject_not_found', detail: 'Key missing', ip });
-    return jsonResponse({ success: false, valid: false, reason: 'not_found', error: 'License Key មិនត្រឹមត្រូវ ឬមិនមានក្នុងប្រព័ន្ធទេ។' }, 404);
+    return jsonResponse({ success: false, valid: false, reason: 'not_found', supportContact, error: 'License Key មិនត្រឹមត្រូវ ឬមិនមានក្នុងប្រព័ន្ធទេ។' }, 404);
   }
 
   if (row.status !== 'active') {
+    recordRateFailure(verifyFailRateMap, ip, 60 * 1000, now);
     await logAudit(env.DB, { licenseKey, machineId, event: `reject_${row.status}`, detail: row.customer_name, ip });
     return jsonResponse(
       {
         success: false,
         valid: false,
         reason: row.status,
+        supportContact,
         error:
           row.status === 'paused'
             ? 'គណនីនេះត្រូវបានផ្អាកបណ្ដោះអាសន្នដោយ Admin។'
@@ -298,15 +465,29 @@ async function handlePublicVerify(request, env) {
     );
   }
 
-  if (row.expires_at !== null && row.expires_at !== undefined && Number(row.expires_at) > 0 && now > Number(row.expires_at)) {
+  const maxMachines = Math.max(1, Number(row.max_machines || 1));
+  const prevBoundRaw = String(row.bound_machines || '[]');
+  const boundMachines = parseBoundMachines(prevBoundRaw);
+  const alreadyBound = boundMachines.includes(machineId);
+  const durationDays = Number(row.duration_days || 0);
+  const isFirstEverActivation = !alreadyBound && boundMachines.length === 0 && !row.first_activated_at && durationDays > 0;
+
+  let effectiveExpiresAt = row.expires_at !== null && row.expires_at !== undefined && Number(row.expires_at) > 0 ? Number(row.expires_at) : null;
+  if (isFirstEverActivation && effectiveExpiresAt !== null) {
+    // Grant full purchased duration starting from the customer's actual first activation moment
+    effectiveExpiresAt = Math.max(effectiveExpiresAt, now + Math.round(durationDays * 86400000));
+  }
+
+  if (effectiveExpiresAt !== null && now > effectiveExpiresAt) {
     await logAudit(env.DB, { licenseKey, machineId, event: 'reject_expired', detail: row.customer_name, ip });
     return jsonResponse(
       {
         success: false,
         valid: false,
         reason: 'expired',
-        expiresAt: Number(row.expires_at),
-        error: 'License Key នេះផុតកំណត់សុពលភាពហើយ។ សូមទាក់ទង Admin ដើម្បីបន្ត។'
+        expiresAt: effectiveExpiresAt,
+        supportContact,
+        error: 'License Key នេះផុតកំណត់សុពលភាពហើយ។ សូមទាក់ទង Admin ដើម្បីបន្តសុពលភាព ($10/ខែ ឬ $50/ឆ្នាំ)។'
       },
       403
     );
@@ -329,15 +510,12 @@ async function handlePublicVerify(request, env) {
         valid: false,
         reason: 'wrong_app',
         requiredApp: appScope,
+        supportContact,
         error: `License Key នេះសម្រាប់តែកម្មវិធី ${neededName} ប៉ុណ្ណោះ (មិនអាចប្រើជាមួយ ${currentName} បានទេ)។`
       },
       403
     );
   }
-
-  const maxMachines = Math.max(1, Number(row.max_machines || 1));
-  const boundMachines = parseBoundMachines(row.bound_machines);
-  const alreadyBound = boundMachines.includes(machineId);
 
   if (!alreadyBound) {
     if (boundMachines.length >= maxMachines) {
@@ -355,12 +533,42 @@ async function handlePublicVerify(request, env) {
           reason: 'machine_limit',
           maxMachines,
           boundCount: boundMachines.length,
+          supportContact,
           error: `License Key នេះបានភ្ជាប់លើម៉ាស៊ីនផ្សេងរួចហើយ (${boundMachines.length}/${maxMachines})! សូមទាក់ទង Admin ដើម្បី Reset ម៉ាស៊ីន។`
         },
         403
       );
     }
     boundMachines.push(machineId);
+    const firstActivatedAt = row.first_activated_at ? Number(row.first_activated_at) : now;
+    const casRes = await env.DB.prepare(
+      `UPDATE licenses
+       SET bound_machines = ?, expires_at = ?, first_activated_at = ?, updated_at = ?, last_seen_at = ?, last_machine_id = ?, last_app_version = ?, verify_count = verify_count + 1
+       WHERE license_key = ? AND bound_machines = ?`
+    )
+      .bind(JSON.stringify(boundMachines), effectiveExpiresAt, firstActivatedAt, now, now, machineId, recordedClientTag, licenseKey, prevBoundRaw)
+      .run();
+    if (!casRes || !casRes.meta || Number(casRes.meta.changes) !== 1) {
+      await logAudit(env.DB, {
+        licenseKey,
+        machineId,
+        event: 'reject_limit_race',
+        detail: `Concurrent bind conflict (${row.customer_name})`,
+        ip
+      });
+      return jsonResponse(
+        {
+          success: false,
+          valid: false,
+          reason: 'machine_limit',
+          maxMachines,
+          boundCount: maxMachines,
+          supportContact,
+          error: `License Key នេះបានភ្ជាប់លើម៉ាស៊ីនផ្សេងរួចហើយ (${maxMachines}/${maxMachines})! សូមទាក់ទង Admin ដើម្បី Reset ម៉ាស៊ីន។`
+        },
+        403
+      );
+    }
     await logAudit(env.DB, {
       licenseKey,
       machineId,
@@ -368,31 +576,40 @@ async function handlePublicVerify(request, env) {
       detail: `Bound ${boundMachines.length}/${maxMachines} (${row.customer_name})`,
       ip
     });
+  } else {
+    await env.DB.prepare(
+      `UPDATE licenses
+       SET updated_at = ?, last_seen_at = ?, last_machine_id = ?, last_app_version = ?, verify_count = verify_count + 1
+       WHERE license_key = ?`
+    )
+      .bind(now, now, machineId, recordedClientTag, licenseKey)
+      .run();
   }
 
-  await env.DB.prepare(
-    `UPDATE licenses
-     SET bound_machines = ?, updated_at = ?, last_seen_at = ?, last_machine_id = ?, last_app_version = ?, verify_count = verify_count + 1
-     WHERE license_key = ?`
-  )
-    .bind(JSON.stringify(boundMachines), now, now, machineId, recordedClientTag, licenseKey)
-    .run();
-
-  const expiresAt = row.expires_at !== null && row.expires_at !== undefined && Number(row.expires_at) > 0 ? Number(row.expires_at) : null;
+  const expiresAt = effectiveExpiresAt;
   const leaseUntil = expiresAt ? Math.min(now + OFFLINE_GRACE_MS, expiresAt) : now + OFFLINE_GRACE_MS;
+  const planId = String(row.plan_id || (expiresAt === null ? 'lifetime' : 'monthly_10'));
+  const priceUsd = Number.isFinite(Number(row.price_usd)) ? Number(row.price_usd) : 0;
+  const warrantySupport = String(row.warranty_support || 'standard_warranty');
 
   const leasePayload = {
     v: 1,
     licenseKey,
     machineId,
     appScope,
+    planId,
+    priceUsd,
+    warrantySupport,
+    maxMachines,
+    boundCount: boundMachines.length,
     status: 'active',
     customerName: String(row.customer_name || ''),
     expiresAt,
     issuedAt: now,
     leaseUntil,
     routerLocked,
-    maintenanceBanner
+    maintenanceBanner,
+    supportContact
   };
   const leaseToken = await signLeaseToken(env, leasePayload);
 
@@ -401,6 +618,9 @@ async function handlePublicVerify(request, env) {
     valid: true,
     leaseToken,
     appScope,
+    planId,
+    priceUsd,
+    warrantySupport,
     customerName: leasePayload.customerName,
     expiresAt,
     maxMachines,
@@ -411,22 +631,33 @@ async function handlePublicVerify(request, env) {
     maintenanceLocked: false,
     minAppVersion,
     downloadUrl,
+    supportContact,
     routerLocked
   });
 }
 
 async function handleAdminRoutes(request, env, pathname) {
   await ensureSchema(env.DB);
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
 
   if (pathname === '/api/admin/login' && request.method === 'POST') {
+    const now = Date.now();
+    if (isRateLimited(adminLoginFailMap, ip, 8, 5 * 60 * 1000, now)) {
+      return jsonResponse({ success: false, error: 'បញ្ចូលលេខសម្ងាត់ខុសច្រើនដងពេក។ សូមរង់ចាំ ៥ នាទី។' }, 429);
+    }
     let body = {};
     try {
       body = await request.json();
     } catch (_) {}
-    const ok = await constantTimeEqual(String(body.secret || '').trim(), String(env.ADMIN_SECRET || '').trim());
-    if (!env.ADMIN_SECRET || !ok) {
+    const expectedAdminSecret = String(env.ADMIN_SECRET || '').trim();
+    const ok = expectedAdminSecret
+      ? await constantTimeEqual(String(body.secret || '').trim(), expectedAdminSecret)
+      : false;
+    if (!expectedAdminSecret || !ok) {
+      recordRateFailure(adminLoginFailMap, ip, 5 * 60 * 1000, now);
       return jsonResponse({ success: false, error: 'លេខសម្ងាត់ Admin មិនត្រឹមត្រូវទេ។' }, 401);
     }
+    adminLoginFailMap.delete(ip);
     return jsonResponse({ success: true });
   }
 
@@ -438,18 +669,24 @@ async function handleAdminRoutes(request, env, pathname) {
   if (pathname === '/api/admin/overview' && request.method === 'GET') {
     const now = Date.now();
     const { results: licenseRows } = await env.DB.prepare('SELECT * FROM licenses ORDER BY created_at DESC').all();
-    const { results: logRows } = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 40').all();
+    const { results: logRows } = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 50').all();
     const settings = await loadSettingsMap(env.DB);
 
     const licenses = (licenseRows || []).map((row) => {
       const boundMachines = parseBoundMachines(row.bound_machines);
       const expiresAt = row.expires_at !== null && row.expires_at !== undefined && Number(row.expires_at) > 0 ? Number(row.expires_at) : null;
       const isExpired = Boolean(expiresAt && now > expiresAt);
+      const planId = String(row.plan_id || (expiresAt === null ? 'lifetime' : 'monthly_10'));
       return {
         licenseKey: row.license_key,
         customerName: row.customer_name || '',
         contact: row.contact || '',
         appScope: normalizeAppScope(row.app_scope),
+        planId,
+        priceUsd: Number.isFinite(Number(row.price_usd)) ? Number(row.price_usd) : 0,
+        durationDays: Number(row.duration_days || 0),
+        firstActivatedAt: row.first_activated_at ? Number(row.first_activated_at) : null,
+        warrantySupport: row.warranty_support || 'standard_warranty',
         status: row.status || 'active',
         effectiveStatus: row.status !== 'active' ? row.status : isExpired ? 'expired' : 'active',
         maxMachines: Number(row.max_machines || 1),
@@ -469,7 +706,9 @@ async function handleAdminRoutes(request, env, pathname) {
       active: licenses.filter((l) => l.effectiveStatus === 'active').length,
       blocked: licenses.filter((l) => l.status === 'paused' || l.status === 'revoked').length,
       expired: licenses.filter((l) => l.effectiveStatus === 'expired').length,
-      seen24h: licenses.filter((l) => l.lastSeenAt && now - l.lastSeenAt <= 24 * 60 * 60 * 1000).length
+      seen24h: licenses.filter((l) => l.lastSeenAt && now - l.lastSeenAt <= 24 * 60 * 60 * 1000).length,
+      monthlyCount: licenses.filter((l) => l.planId === 'monthly_10' && l.effectiveStatus === 'active').length,
+      yearlyCount: licenses.filter((l) => l.planId === 'yearly_50' && l.effectiveStatus === 'active').length
     };
 
     return jsonResponse({
@@ -495,25 +734,42 @@ async function handleAdminRoutes(request, env, pathname) {
     const customerName = String(body.customerName || '').trim().slice(0, 120);
     const contact = String(body.contact || '').trim().slice(0, 120);
     const appScope = normalizeAppScope(body.appScope);
-    const durationDays = Number(body.durationDays || 0);
+    const planSpec = normalizePlanSpec(body.planId, body.durationDays, body.priceUsd);
+    const durationDays = planSpec.durationDays;
     const maxMachines = Math.max(1, Math.min(20, Number(body.maxMachines || 1)));
     const prebind = normalizeMachineId(body.prebindMachineId || '');
     const boundMachines = prebind && prebind.length >= 8 ? [prebind] : [];
+    const firstActivatedAt = boundMachines.length > 0 ? now : null;
     const expiresAt = Number.isFinite(durationDays) && durationDays > 0 ? now + Math.round(durationDays * 86400000) : null;
 
     await env.DB.prepare(
-      `INSERT INTO licenses (license_key, customer_name, contact, app_scope, status, max_machines, bound_machines, expires_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`
+      `INSERT INTO licenses (license_key, customer_name, contact, app_scope, plan_id, price_usd, duration_days, first_activated_at, warranty_support, status, max_machines, bound_machines, expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`
     )
-      .bind(licenseKey, customerName, contact, appScope, maxMachines, JSON.stringify(boundMachines), expiresAt, now, now)
+      .bind(
+        licenseKey,
+        customerName,
+        contact,
+        appScope,
+        planSpec.planId,
+        planSpec.priceUsd,
+        durationDays,
+        firstActivatedAt,
+        planSpec.warrantySupport,
+        maxMachines,
+        JSON.stringify(boundMachines),
+        expiresAt,
+        now,
+        now
+      )
       .run();
 
     await logAudit(env.DB, {
       licenseKey,
       machineId: prebind,
       event: 'admin_create',
-      detail: `${customerName || 'Customer'} [${appScope}] (${durationDays > 0 ? durationDays + 'd' : 'Lifetime'})`,
-      ip: request.headers.get('cf-connecting-ip') || ''
+      detail: `${customerName || 'Customer'} [${planSpec.planId} $${planSpec.priceUsd}] (${durationDays > 0 ? durationDays + 'd' : 'Lifetime'})`,
+      ip
     });
 
     return jsonResponse({
@@ -523,6 +779,10 @@ async function handleAdminRoutes(request, env, pathname) {
         customerName,
         contact,
         appScope,
+        planId: planSpec.planId,
+        priceUsd: planSpec.priceUsd,
+        durationDays,
+        warrantySupport: planSpec.warrantySupport,
         status: 'active',
         maxMachines,
         boundMachines,
@@ -547,7 +807,6 @@ async function handleAdminRoutes(request, env, pathname) {
     if (!row) return jsonResponse({ success: false, error: 'License Key មិនមានទេ' }, 404);
 
     const now = Date.now();
-    const ip = request.headers.get('cf-connecting-ip') || '';
 
     if (action === 'set_status') {
       const nextStatus = ['active', 'paused', 'revoked'].includes(body.status) ? body.status : 'paused';
@@ -566,29 +825,87 @@ async function handleAdminRoutes(request, env, pathname) {
       return jsonResponse({ success: true });
     }
 
-    if (action === 'extend_days') {
-      const days = Number(body.days || 0);
-      let nextExpires = null;
-      if (Number.isFinite(days) && days > 0) {
-        const baseMs = row.expires_at && Number(row.expires_at) > now ? Number(row.expires_at) : now;
-        nextExpires = baseMs + Math.round(days * 86400000);
+    if (action === 'unbind_machine') {
+      const targetMachine = normalizeMachineId(body.machineId || '');
+      if (!targetMachine) {
+        return jsonResponse({ success: false, error: 'Missing machineId' }, 400);
       }
-      await env.DB.prepare("UPDATE licenses SET expires_at = ?, status = 'active', updated_at = ? WHERE license_key = ?")
-        .bind(nextExpires, now, licenseKey)
+      const nextMachines = parseBoundMachines(row.bound_machines).filter((m) => m !== targetMachine);
+      await env.DB.prepare('UPDATE licenses SET bound_machines = ?, updated_at = ? WHERE license_key = ?')
+        .bind(JSON.stringify(nextMachines), now, licenseKey)
+        .run();
+      await logAudit(env.DB, { licenseKey, machineId: targetMachine, event: 'admin_unbind_hwid', detail: row.customer_name, ip });
+      return jsonResponse({ success: true, boundMachines: nextMachines });
+    }
+
+    if (action === 'extend_days') {
+      if (row.status === 'revoked') {
+        return jsonResponse(
+          {
+            success: false,
+            error: 'គណនីនេះកំពុងជាប់ Ban (Revoked) — សូមចុចបើកសកម្ម (Active) ជាមុនសិនមុនបន្តថ្ងៃ។'
+          },
+          409
+        );
+      }
+
+      const explicitLifetime = body.lifetime === true;
+      if (explicitLifetime) {
+        await env.DB.prepare("UPDATE licenses SET expires_at = NULL, plan_id = 'lifetime', duration_days = 0, warranty_support = 'vip_warranty', status = 'active', updated_at = ? WHERE license_key = ?")
+          .bind(now, licenseKey)
+          .run();
+        await logAudit(env.DB, {
+          licenseKey,
+          event: 'admin_extend',
+          detail: `Lifetime (${row.customer_name})`,
+          ip
+        });
+        return jsonResponse({ success: true, expiresAt: null, planId: 'lifetime' });
+      }
+
+      const days = Number(body.days);
+      if (!Number.isFinite(days) || days <= 0) {
+        return jsonResponse({ success: false, error: 'ចំនួនថ្ងៃបន្តសុពលភាពត្រូវតែធំជាង ០។' }, 400);
+      }
+
+      const isCurrentlyLifetime = row.expires_at === null || String(row.plan_id || '') === 'lifetime';
+      if (isCurrentlyLifetime) {
+        return jsonResponse(
+          {
+            success: false,
+            error: 'គណនីនេះជា Lifetime រួចហើយ (មិនចាំបាច់បន្តថ្ងៃទេ)។'
+          },
+          409
+        );
+      }
+
+      const baseMs = row.expires_at && Number(row.expires_at) > now ? Number(row.expires_at) : now;
+      const roundedDays = Math.round(days);
+      const nextExpires = baseMs + roundedDays * 86400000;
+      const renewSpec = normalizePlanSpec(body.planId || '', roundedDays, body.priceUsd);
+      const nextPlanId = renewSpec.planId !== 'custom' ? renewSpec.planId : (row.plan_id || 'custom');
+      const nextPrice = renewSpec.priceUsd > 0 ? renewSpec.priceUsd : Number(row.price_usd || 0);
+
+      await env.DB.prepare("UPDATE licenses SET expires_at = ?, plan_id = ?, price_usd = ?, duration_days = ?, status = 'active', updated_at = ? WHERE license_key = ?")
+        .bind(nextExpires, nextPlanId, nextPrice, roundedDays, now, licenseKey)
         .run();
       await logAudit(env.DB, {
         licenseKey,
         event: 'admin_extend',
-        detail: nextExpires ? `+${days}d (${row.customer_name})` : `Lifetime (${row.customer_name})`,
+        detail: `+${roundedDays}d [${nextPlanId}] (${row.customer_name})`,
         ip
       });
-      return jsonResponse({ success: true, expiresAt: nextExpires });
+      return jsonResponse({ success: true, expiresAt: nextExpires, planId: nextPlanId });
     }
 
     if (action === 'update_info') {
       const customerName = String(body.customerName ?? row.customer_name).trim().slice(0, 120);
       const contact = String(body.contact ?? row.contact).trim().slice(0, 120);
-      const maxMachines = Math.max(1, Math.min(20, Number(body.maxMachines ?? row.max_machines ?? 1)));
+      const rawMax = body.maxMachines;
+      const parsedMax = (rawMax !== '' && rawMax !== undefined && rawMax !== null) ? Number(rawMax) : NaN;
+      const maxMachines = Number.isFinite(parsedMax)
+        ? Math.max(1, Math.min(20, Math.round(parsedMax)))
+        : Math.max(1, Number(row.max_machines || 1));
       const appScope = normalizeAppScope(body.appScope ?? row.app_scope);
       await env.DB.prepare('UPDATE licenses SET customer_name = ?, contact = ?, max_machines = ?, app_scope = ?, updated_at = ? WHERE license_key = ?')
         .bind(customerName, contact, maxMachines, appScope, now, licenseKey)
@@ -619,6 +936,7 @@ async function handleAdminRoutes(request, env, pathname) {
       ['maintenance_locked', body.maintenance_locked ? '1' : '0'],
       ['min_app_version', String(body.min_app_version || '1.0.0').trim().slice(0, 32)],
       ['download_url', String(body.download_url || '').trim().slice(0, 400)],
+      ['support_contact', String(body.support_contact || 'https://t.me/ezapro_support').trim().slice(0, 300)],
       ['router_locked', body.router_locked ? '1' : '0']
     ];
     for (const [key, value] of pairs) {
@@ -655,7 +973,7 @@ export default {
       }
       return jsonResponse({ success: false, error: 'Not found' }, 404);
     } catch (err) {
-      return jsonResponse({ success: false, error: err && err.message ? err.message : 'Internal server error' }, 500);
+      return jsonResponse({ success: false, error: err && err.message ? err.message : 'Server error' }, 500);
     }
   }
 };

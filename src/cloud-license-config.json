@@ -8,5 +8,6 @@
     "crv": "P-256"
   },
   "enforceInPackaged": true,
-  "offlineGraceHours": 12
+  "offlineGraceHours": 48,
+  "defaultSupportContact": "https://t.me/ezapro_support"
 }

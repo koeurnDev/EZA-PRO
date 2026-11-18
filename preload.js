@@ -15,7 +15,7 @@ if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(backendUrl)) {
 contextBridge.exposeInMainWorld('electronAPI', {
   backendUrl,
   // Native folder picker
-  openFolderDialog: () => ipcRenderer.invoke('open-folder-dialog'),
+  openFolderDialog: (options) => ipcRenderer.invoke('open-folder-dialog', options),
   
   // Native file picker
   openFileDialog: (options) => ipcRenderer.invoke('open-file-dialog', options),
@@ -39,6 +39,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   
   // App version
   version: require('./package.json').version,
+
+  // Warranty & maintenance support helpers
+  openExternalLink: (url) => ipcRenderer.invoke('support:open-external', url),
+  revealSupportLogs: () => ipcRenderer.invoke('support:reveal-logs'),
+  openExportFolder: (targetPath) => ipcRenderer.invoke('export:open-folder', targetPath),
   
   // Node path utilities (safe to expose)
   path: {

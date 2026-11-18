@@ -16,7 +16,7 @@ function getExportDir() {
 
 function srtTimeToSeconds(value) {
   if (typeof value !== 'string') return null;
-  const match = /^(\d+):(\d{2}):(\d{2})[,.](\d{1,3})$/.exec(value.trim());
+  const match = /^(\d+):(\d{2}):(\d{2})[,.](\d{1,3})(?:\s+.*)?$/.exec(value.trim());
   if (!match) return null;
 
   const milliseconds = Number(match[4].padEnd(3, '0'));
@@ -80,15 +80,22 @@ function parseSrt(rawText) {
 }
 
 function serializeSrt(cues) {
-  return cues.map((cue, i) => {
-    const idx = i + 1;
-    const startSec = Math.max(0, Number(cue.startSec) || 0);
-    const endSec = Math.max(startSec, Number(cue.endSec) || startSec);
-    const start = secondsToSrtTime(startSec);
-    const end = secondsToSrtTime(endSec);
-    const txt = String(cue.translated || cue.text || '').replace(/\r\n?/g, '\n').trim();
-    return `${idx}\n${start} --> ${end}\n${txt}`;
-  }).join('\n\n') + '\n';
+  if (!Array.isArray(cues)) return '';
+  return cues
+    .filter(cue => cue && typeof cue === 'object')
+    .map((cue, i) => {
+      const idx = i + 1;
+      const startSec = Math.max(0, Number(cue.startSec) || 0);
+      const endSec = Math.max(startSec, Number(cue.endSec) || startSec);
+      const start = secondsToSrtTime(startSec);
+      const end = secondsToSrtTime(endSec);
+      const rawTxt = (cue.translated !== undefined && cue.translated !== null && (cue.translated !== '' || Boolean(cue.translatedLang)))
+        ? cue.translated
+        : (cue.text || '');
+      const txt = String(rawTxt).replace(/\r\n?/g, '\n').replace(/\n{2,}/g, '\n').trim();
+      return `${idx}\n${start} --> ${end}\n${txt}`;
+    })
+    .join('\n\n') + '\n';
 }
 
 router.post('/', (req, res) => {
@@ -114,6 +121,9 @@ function loadSrtFileHandler(req, res) {
   }
 
   const normalized = path.normalize(filePath);
+  if (normalized.startsWith('\\\\') || normalized.startsWith('//') || normalized.slice(2).includes(':')) {
+    return res.status(403).json({ success: false, error: 'Invalid or forbidden srt file path.' });
+  }
   let stats;
   try {
     stats = fs.statSync(normalized);
@@ -151,10 +161,18 @@ function saveSrtFileHandler(req, res) {
 
   let savePath;
   if (typeof filePath === 'string' && filePath.trim()) {
-    if (!path.isAbsolute(filePath.trim())) {
+    const rawTrimmed = filePath.trim();
+    if (!path.isAbsolute(rawTrimmed)) {
       return res.status(400).json({ success: false, error: 'filePath must be an absolute path.' });
     }
-    savePath = path.normalize(filePath.trim());
+    savePath = path.normalize(rawTrimmed);
+    if (savePath.startsWith('\\\\') || savePath.startsWith('//') || savePath.slice(2).includes(':')) {
+      return res.status(403).json({ success: false, error: 'Invalid or forbidden target path.' });
+    }
+    const baseName = path.basename(savePath);
+    if (!baseName || /[.\s]+$/.test(baseName) || path.extname(savePath).toLowerCase() !== '.srt') {
+      return res.status(403).json({ success: false, error: 'filePath must end with .srt' });
+    }
   } else {
     const exportDir = getExportDir();
     fs.mkdirSync(exportDir, { recursive: true });
@@ -171,6 +189,92 @@ function saveSrtFileHandler(req, res) {
   }
 }
 
+function readSafeCompanionSrt(candPath) {
+  const stat = fs.statSync(candPath);
+  if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_SRT_BYTES) return null;
+  const raw = fs.readFileSync(candPath, 'utf8');
+  const cues = parseSrt(raw);
+  return cues.length > 0 ? cues : null;
+}
+
+function findCompanionSrtHandler(req, res) {
+  const { videoPath } = req.body || {};
+  if (typeof videoPath !== 'string' || !videoPath.trim()) {
+    return res.status(400).json({ success: false, error: 'videoPath is required.' });
+  }
+  const normalized = path.normalize(videoPath.trim());
+  if (!path.isAbsolute(normalized) || normalized.startsWith('\\\\') || normalized.startsWith('//') || normalized.slice(2).includes(':')) {
+    return res.status(400).json({ success: false, error: 'videoPath must be a valid local absolute path.' });
+  }
+  const dir = path.dirname(normalized);
+  const ext = path.extname(normalized);
+  const stem = path.basename(normalized, ext);
+
+  // Common subtitle naming patterns:
+  const candidates = [
+    path.join(dir, `${stem}.srt`),
+    path.join(dir, `${stem}.zh.srt`),
+    path.join(dir, `${stem}.zh-CN.srt`),
+    path.join(dir, `${stem}.chs.srt`),
+    path.join(dir, `${stem}.chi.srt`),
+    path.join(dir, `${stem}.en.srt`),
+    path.join(dir, `${stem}.km.srt`),
+    path.join(dir, 'subtitles', `${stem}.srt`),
+    path.join(dir, 'Subtitles', `${stem}.srt`),
+  ];
+
+  for (const cand of candidates) {
+    if (fs.existsSync(cand)) {
+      try {
+        const cues = readSafeCompanionSrt(cand);
+        if (cues) {
+          return res.json({
+            success: true,
+            found: true,
+            filePath: cand,
+            fileName: path.basename(cand),
+            cues
+          });
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Check if any companion .srt with matching video stem exists in same folder (never match unrelated SRT files)
+  try {
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+      const files = fs.readdirSync(dir);
+      const stemLower = stem.toLowerCase();
+      const matchingSrt = files.find((f) => {
+        if (!/\.srt$/i.test(f)) return false;
+        const fStemLower = path.basename(f, path.extname(f)).toLowerCase();
+        return (
+          fStemLower === stemLower ||
+          fStemLower.startsWith(`${stemLower}.`) ||
+          fStemLower.startsWith(`${stemLower}_`) ||
+          fStemLower.startsWith(`${stemLower}-`) ||
+          fStemLower.startsWith(`${stemLower} `)
+        );
+      });
+      if (matchingSrt) {
+        const fullPath = path.join(dir, matchingSrt);
+        const cues = readSafeCompanionSrt(fullPath);
+        if (cues) {
+          return res.json({
+            success: true,
+            found: true,
+            filePath: fullPath,
+            fileName: matchingSrt,
+            cues
+          });
+        }
+      }
+    }
+  } catch (_) {}
+
+  return res.json({ success: true, found: false });
+}
+
 module.exports = router;
 module.exports.srtTimeToSeconds = srtTimeToSeconds;
 module.exports.parseSrt = parseSrt;
@@ -179,3 +283,4 @@ module.exports.secondsToSrtTime = secondsToSrtTime;
 module.exports.secondsToDisplayTime = secondsToDisplayTime;
 module.exports.loadSrtFileHandler = loadSrtFileHandler;
 module.exports.saveSrtFileHandler = saveSrtFileHandler;
+module.exports.findCompanionSrtHandler = findCompanionSrtHandler;

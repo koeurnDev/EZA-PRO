@@ -1,21 +1,20 @@
-MIT License
+EZA PRO - Commercial Software License & Warranty Agreement
+Copyright (c) 2026 EZA PRO. All rights reserved.
 
-Copyright (c) 2024 EZA PRO
+1. GRANT OF SUBSCRIPTION LICENSE
+EZA PRO ("the Software") is licensed, not sold, to you on an active subscription basis:
+- Monthly Plan ($10 USD / 30 days)
+- Annual Plan ($50 USD / 365 days)
+Each license key authorizes activation on the number of devices specified in your plan (1 PC by default),starting from your first activation date.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+2. WARRANTY & TECHNICAL MAINTENANCE SUPPORT
+Throughout your active subscription period, EZA PRO includes full technical maintenance, bug-fix updates, and customer troubleshooting support:
+- Free software updates and compatibility patches during your active subscription.
+- Priority troubleshooting assistance via official EZA PRO Support (you may export diagnostic logs from the in-app Support Hub without sharing private API keys).
+- Free hardware-ID reset assistance when upgrading or reinstalling Windows on your licensed computer.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+3. RESTRICTIONS
+You may not redistribute, resell, rent, share license keys across unauthorized machines, reverse-engineer, decompile, or bypass the cloud license verification mechanism of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+4. DATA PRIVACY
+Your video files, subtitle drafts, and API keys remain stored locally on your machine. Diagnostic support bundles automatically redact API keys and authentication secrets.

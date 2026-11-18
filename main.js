@@ -3,12 +3,41 @@
  * Desktop Application Entry Point
  */
 
-const { app, BrowserWindow, ipcMain, dialog, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 const express = require('express');
+const logger = require('./src/backend/utils/logger');
+
+process.on('uncaughtException', (err) => {
+  logger.logError('MainProcess:uncaughtException', err);
+  console.error('[Main] Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.logError('MainProcess:unhandledRejection', reason instanceof Error ? reason : String(reason));
+  console.error('[Main] Unhandled rejection:', reason);
+});
+
+let shouldRunMainApp = true;
+
+if (app && typeof app.requestSingleInstanceLock === 'function') {
+  const gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) {
+    shouldRunMainApp = false;
+    app.quit();
+  } else {
+    app.on('second-instance', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+  }
+}
 
 // Import backend server
 const backendApp = express();
@@ -20,7 +49,8 @@ const geminiKeyPath = path.join(app.getPath('userData'), 'gemini-api-key.bin');
 const geminiAccountsPath = path.join(app.getPath('userData'), 'gemini-accounts.bin');
 const legacyGeminiAccountsPath = path.join(__dirname, 'accounts.json');
 
-function loadGeminiAccounts() {
+function loadGeminiAccounts(options = {}) {
+  const { syncDesktop = false } = options || {};
   if (!fs.existsSync(geminiAccountsPath)) {
     return { accounts: [], activeAccountId: null };
   }
@@ -28,26 +58,35 @@ function loadGeminiAccounts() {
     throw new Error('Secure system storage is unavailable. Cannot read Gemini accounts.');
   }
 
-  const encrypted = fs.readFileSync(geminiAccountsPath);
-  const data = JSON.parse(safeStorage.decryptString(encrypted));
+  let data;
+  try {
+    const encrypted = fs.readFileSync(geminiAccountsPath);
+    data = JSON.parse(safeStorage.decryptString(encrypted));
+  } catch (err) {
+    console.warn('[Main] Saved Gemini account file unreadable/corrupt, starting fresh:', err.message);
+    return { accounts: [], activeAccountId: null };
+  }
   if (!data || !Array.isArray(data.accounts) ||
-      !(data.activeAccountId === null || typeof data.activeAccountId === 'string') ||
-      data.accounts.some(account => !account ||
-        typeof account.id !== 'string' ||
-        typeof account.name !== 'string' ||
-        typeof account.email !== 'string' ||
-        typeof account.apiKey !== 'string')) {
-    throw new Error('Saved Gemini account data is invalid.');
+    !(data.activeAccountId === null || typeof data.activeAccountId === 'string') ||
+    data.accounts.some(account => !account ||
+      typeof account.id !== 'string' ||
+      typeof account.name !== 'string' ||
+      typeof account.email !== 'string' ||
+      typeof account.apiKey !== 'string')) {
+    console.warn('[Main] Saved Gemini account structure invalid, starting fresh.');
+    return { accounts: [], activeAccountId: null };
   }
   if (data.activeAccountId !== null && !data.accounts.some(account => account.id === data.activeAccountId)) {
-    throw new Error('Saved active Gemini account is missing.');
+    data.activeAccountId = data.accounts.length > 0 ? data.accounts[0].id : null;
   }
-  try {
-    const configRouter = require('./src/backend/routes/config');
-    if (typeof configRouter.syncAccountsFromDesktop === 'function') {
-      configRouter.syncAccountsFromDesktop(data);
-    }
-  } catch (_) {}
+  if (syncDesktop) {
+    try {
+      const configRouter = require('./src/backend/routes/config');
+      if (typeof configRouter.syncAccountsFromDesktop === 'function') {
+        configRouter.syncAccountsFromDesktop(data);
+      }
+    } catch (_) { }
+  }
   return data;
 }
 
@@ -57,15 +96,30 @@ function saveGeminiAccounts(data) {
   }
 
   fs.mkdirSync(path.dirname(geminiAccountsPath), { recursive: true });
-  const temporaryPath = `${geminiAccountsPath}.tmp`;
-  fs.writeFileSync(temporaryPath, safeStorage.encryptString(JSON.stringify(data)), { mode: 0o600 });
-  fs.renameSync(temporaryPath, geminiAccountsPath);
+  const temporaryPath = `${geminiAccountsPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, safeStorage.encryptString(JSON.stringify(data)), { mode: 0o600 });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.renameSync(temporaryPath, geminiAccountsPath);
+        break;
+      } catch (err) {
+        if ((err.code !== 'EPERM' && err.code !== 'EBUSY' && err.code !== 'EACCES') || attempt === 4) {
+          throw err;
+        }
+        const sab = new SharedArrayBuffer(4);
+        Atomics.wait(new Int32Array(sab), 0, 0, 25 * (attempt + 1));
+      }
+    }
+  } finally {
+    try { if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath); } catch (_) { }
+  }
   try {
     const configRouter = require('./src/backend/routes/config');
     if (typeof configRouter.syncAccountsFromDesktop === 'function') {
-      configRouter.syncAccountsFromDesktop(data);
+      configRouter.syncAccountsFromDesktop(data, { authoritative: true });
     }
-  } catch (_) {}
+  } catch (_) { }
 }
 
 function createGeminiAccount(name, email, apiKey) {
@@ -144,9 +198,16 @@ function migrateLegacyGeminiKey() {
   let hasEnvKey = false;
 
   if (fs.existsSync(configPath)) {
-    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    hasConfigKey = Object.prototype.hasOwnProperty.call(config, 'GEMINI_API_KEY');
-    configKey = typeof config.GEMINI_API_KEY === 'string' ? config.GEMINI_API_KEY.trim() : '';
+    try {
+      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        config = parsed;
+      }
+      hasConfigKey = Object.prototype.hasOwnProperty.call(config, 'GEMINI_API_KEY');
+      configKey = typeof config.GEMINI_API_KEY === 'string' ? config.GEMINI_API_KEY.trim() : '';
+    } catch (err) {
+      console.warn('[Main] Skipping invalid config.json during legacy migration:', err.message);
+    }
   }
 
   if (fs.existsSync(envPath)) {
@@ -156,12 +217,24 @@ function migrateLegacyGeminiKey() {
     envKey = match ? match[1].replace(/^(['"])(.*)\1$/, '$2').trim() : '';
   }
 
-  const existingKey = getGeminiApiKey();
+  let data = { accounts: [] };
+  try {
+    data = loadGeminiAccounts();
+  } catch (err) {
+    console.warn('[Main] Skipping legacy key migration when accounts unavailable:', err.message);
+    return;
+  }
   const processKey = typeof process.env.GEMINI_API_KEY === 'string'
     ? process.env.GEMINI_API_KEY.trim()
     : '';
   const legacyKey = processKey || envKey || configKey;
-  if (!existingKey && legacyKey) saveGeminiApiKey(legacyKey);
+  if (legacyKey && !data.accounts.some(acc => acc.apiKey === legacyKey) && data.accounts.length === 0) {
+    try {
+      saveGeminiApiKey(legacyKey);
+    } catch (err) {
+      console.warn('[Main] Skipping legacy Gemini key migration:', err.message);
+    }
+  }
 
   if (hasConfigKey && !app.isPackaged) {
     delete config.GEMINI_API_KEY;
@@ -180,27 +253,45 @@ function migrateLegacyGeminiKey() {
 }
 
 function migrateLegacyGeminiAccount() {
-  const data = loadGeminiAccounts();
-  if (data.accounts.length > 0 || !fs.existsSync(geminiKeyPath)) return;
+  try {
+    const data = loadGeminiAccounts({ syncDesktop: true });
+    if (data.accounts.length > 0 || !fs.existsSync(geminiKeyPath)) return;
 
-  const apiKey = safeStorage.decryptString(fs.readFileSync(geminiKeyPath));
-  if (!apiKey) return;
+    const apiKey = safeStorage.decryptString(fs.readFileSync(geminiKeyPath));
+    if (!apiKey) return;
 
-  const account = createGeminiAccount('Gemini Account', '', apiKey);
-  saveGeminiAccounts({ accounts: [account], activeAccountId: account.id });
-  fs.unlinkSync(geminiKeyPath);
+    const account = createGeminiAccount('Gemini Account', '', apiKey);
+    saveGeminiAccounts({ accounts: [account], activeAccountId: account.id });
+    try { fs.unlinkSync(geminiKeyPath); } catch (_) { }
+  } catch (err) {
+    logger.logWarn('Main:migrateLegacyGeminiAccount', err.message);
+    console.warn('[Main] Skipping unreadable legacy gemini-api-key.bin:', err.message);
+  }
 }
 
 function migrateLegacyGeminiAccountsFile() {
   if (!fs.existsSync(legacyGeminiAccountsPath)) return;
 
-  const legacyData = JSON.parse(fs.readFileSync(legacyGeminiAccountsPath, 'utf8'));
+  let legacyData;
+  try {
+    legacyData = JSON.parse(fs.readFileSync(legacyGeminiAccountsPath, 'utf8'));
+  } catch (err) {
+    console.warn('[Main] Ignoring unreadable legacy accounts.json:', err.message);
+    return;
+  }
   if (!legacyData || !Array.isArray(legacyData.accounts)) {
-    throw new Error('Legacy Gemini accounts file has an invalid format.');
+    console.warn('[Main] Legacy Gemini accounts file has invalid format, skipping.');
+    return;
   }
 
-  const data = loadGeminiAccounts();
-  const hadAccounts = data.accounts.length > 0;
+  let data;
+  try {
+    data = loadGeminiAccounts();
+  } catch (err) {
+    logger.logWarn('Main:migrateLegacyGeminiAccountsFile', err.message);
+    console.warn('[Main] Skipping legacy accounts.json migration:', err.message);
+    return;
+  }
   const accountIds = new Set(data.accounts.map(account => account.id));
   const accountsByKey = new Map(data.accounts.map(account => [account.apiKey, account]));
   const migratedIds = new Map();
@@ -210,14 +301,15 @@ function migrateLegacyGeminiAccountsFile() {
     const email = typeof legacyAccount?.email === 'string' ? legacyAccount.email.trim() : '';
     const apiKey = typeof legacyAccount?.apiKey === 'string' ? legacyAccount.apiKey.trim() : '';
     if (!name || name.length > 80 || email.length > 254 || apiKey.length < 20 || apiKey.length > 512) {
-      throw new Error('Legacy Gemini accounts file contains invalid account data.');
+      console.warn('[Main] Skipping malformed entry in legacy accounts.json');
+      return;
     }
 
     let account = accountsByKey.get(apiKey);
     if (!account) {
       account = createGeminiAccount(name, email, apiKey);
       if (typeof legacyAccount.id === 'string' && legacyAccount.id &&
-          !accountIds.has(legacyAccount.id)) {
+        !accountIds.has(legacyAccount.id)) {
         account.id = legacyAccount.id;
       }
       if (typeof legacyAccount.createdAt === 'string') account.createdAt = legacyAccount.createdAt;
@@ -235,14 +327,30 @@ function migrateLegacyGeminiAccountsFile() {
   if (legacyActiveId) data.activeAccountId = legacyActiveId;
   if (!data.activeAccountId && data.accounts.length > 0) data.activeAccountId = data.accounts[0].id;
 
-  saveGeminiAccounts(data);
-  fs.unlinkSync(legacyGeminiAccountsPath);
+  try {
+    saveGeminiAccounts(data);
+    if (!app.isPackaged) {
+      try { fs.unlinkSync(legacyGeminiAccountsPath); } catch (_) { }
+    }
+  } catch (err) {
+    logger.logWarn('Main:migrateLegacyGeminiAccountsFile:save', err.message);
+  }
 }
 
 function assertGeminiKeyRequestIsFromMainFrame(event) {
   if (!mainWindow || event.sender !== mainWindow.webContents ||
-      event.senderFrame !== mainWindow.webContents.mainFrame ||
-      event.senderFrame.url !== pathToFileURL(path.join(__dirname, 'src', 'frontend', 'index.html')).href) {
+    event.senderFrame !== mainWindow.webContents.mainFrame) {
+    throw new Error('Unauthorized API key request.');
+  }
+  const expectedUrl = pathToFileURL(path.join(__dirname, 'src', 'frontend', 'index.html'));
+  let senderUrl;
+  try {
+    senderUrl = new URL(event.senderFrame.url);
+  } catch (_) {
+    throw new Error('Unauthorized API key request.');
+  }
+  if (senderUrl.protocol !== 'file:' ||
+    `${senderUrl.origin}${senderUrl.pathname}` !== `${expectedUrl.origin}${expectedUrl.pathname}`) {
     throw new Error('Unauthorized API key request.');
   }
 }
@@ -258,34 +366,37 @@ function setupBackend() {
     }
     if (origin === 'null') {
       res.setHeader('Access-Control-Allow-Origin', 'null');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Range, x-eza-access-token');
       res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
       if (req.method === 'OPTIONS') return res.sendStatus(204);
     }
     next();
   });
-  
+
   // Inject API key getter into request
   backendApp.use((req, res, next) => {
     req.getGeminiApiKey = getGeminiApiKey;
     next();
   });
-  
+
   // Serve static files (audio cache, cloned voice samples, etc)
   const voiceCloner = require('./src/backend/utils/voice-cloner');
   backendApp.use('/audio_cache', express.static(process.env.AUDIO_CACHE_DIR || path.join(__dirname, 'audio_cache')));
-  backendApp.use('/cloned_voices', (req, res, next) => express.static(voiceCloner.getClonedVoicesDir())(req, res, next));
-  
+  const clonedVoicesStatic = express.static(voiceCloner.getClonedVoicesDir());
+  backendApp.use('/cloned_voices', clonedVoicesStatic);
+
   // Setup API routes using Express Router
   const { setupRoutes } = require('./src/backend/routes');
   setupRoutes(backendApp);
-  
+
   // Start backend on random available port
   return new Promise((resolve, reject) => {
     backendServer = backendApp.listen(0, '127.0.0.1', () => {
       backendServer.requestTimeout = 0;
       backendPort = backendServer.address().port;
+      process.env.PORT = String(backendPort);
+      logger.logInfo('Main:backend', `Backend server running on http://127.0.0.1:${backendPort} (packaged=${app.isPackaged ? '1' : '0'})`);
       console.log(`⚡ Backend server running on http://127.0.0.1:${backendPort}`);
       resolve(backendPort);
     });
@@ -315,7 +426,27 @@ function createWindow() {
   });
 
   // Load frontend
-  mainWindow.loadFile(path.join(__dirname, 'src', 'frontend', 'index.html'));
+  const indexHtmlPath = path.join(__dirname, 'src', 'frontend', 'index.html');
+  const expectedIndexUrl = pathToFileURL(indexHtmlPath).href;
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
+    try {
+      const targetNoHash = String(targetUrl || '').split('#')[0];
+      const expectedNoHash = expectedIndexUrl.split('#')[0];
+      if (targetNoHash !== expectedNoHash) {
+        event.preventDefault();
+      }
+    } catch (_) {
+      event.preventDefault();
+    }
+  });
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    logger.logError('Main:did-fail-load', `code=${errorCode} ${errorDescription} url=${validatedURL}`);
+  });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    logger.logError('Main:render-process-gone', JSON.stringify(details || {}));
+  });
+  mainWindow.loadFile(indexHtmlPath);
 
   const bringToFront = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -335,7 +466,6 @@ function createWindow() {
 
   // Show and bring window to foreground when ready
   mainWindow.once('ready-to-show', bringToFront);
-  mainWindow.webContents.once('did-finish-load', bringToFront);
 
   // Open DevTools only in explicit development mode; block F12 / Ctrl+Shift+I in packaged builds
   if (process.env.NODE_ENV === 'development' && !app.isPackaged && process.env.EZA_LOCK_DEVTOOLS !== '1') {
@@ -362,103 +492,193 @@ function createWindow() {
 }
 
 function configurePackagedPaths() {
+  process.env.EZA_PACKAGED = app.isPackaged ? '1' : '0';
   if (!app.isPackaged) return;
   const userDataDir = app.getPath('userData');
   let videosBaseDir = userDataDir;
   try {
     videosBaseDir = app.getPath('videos') || userDataDir;
-  } catch (_) {}
+  } catch (_) { }
 
   process.env.EZA_PACKAGED_CLIENT = '1';
+  delete process.env.GEMINI_API_KEY;
   process.env.EZA_USER_DATA_DIR = process.env.EZA_USER_DATA_DIR || userDataDir;
+  process.env.EZA_LOG_DIR = process.env.EZA_LOG_DIR || path.join(userDataDir, 'logs');
   process.env.EZA_CONFIG_FILE = process.env.EZA_CONFIG_FILE || path.join(userDataDir, 'config.json');
   process.env.GEMINI_ACCOUNTS_FILE = process.env.GEMINI_ACCOUNTS_FILE || path.join(userDataDir, 'gemini-accounts.json');
   process.env.AUDIO_CACHE_DIR = process.env.AUDIO_CACHE_DIR || path.join(userDataDir, 'audio_cache');
   process.env.BGM_CACHE_DIR = process.env.BGM_CACHE_DIR || path.join(userDataDir, 'bgm_cache');
   process.env.TRANSLATION_CACHE_DIR = process.env.TRANSLATION_CACHE_DIR || path.join(userDataDir, 'translation_cache');
+  process.env.SERIES_GLOSSARY_DIR = process.env.SERIES_GLOSSARY_DIR || path.join(userDataDir, 'series_glossaries');
   process.env.DRAFTS_DIR = process.env.DRAFTS_DIR || path.join(userDataDir, 'drafts');
   process.env.UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(userDataDir, 'uploads');
   process.env.CLONED_VOICES_DIR = process.env.CLONED_VOICES_DIR || path.join(userDataDir, 'cloned_voices');
-  process.env.VOICE_CLONE_ENGINE_DIR = process.env.VOICE_CLONE_ENGINE_DIR || userDataDir;
+  process.env.VOICE_CLONE_ENGINE_DIR = process.env.VOICE_CLONE_ENGINE_DIR || path.join(userDataDir, 'voice_clone_engine');
+  process.env.AUDIO_SEPARATOR_MODEL_DIR = process.env.AUDIO_SEPARATOR_MODEL_DIR || path.join(userDataDir, 'ai_models', 'audio_separator');
+  process.env.TORCH_HOME = process.env.TORCH_HOME || path.join(userDataDir, 'ai_models', 'torch');
+  process.env.SENSEVOICE_CACHE_DIR = process.env.SENSEVOICE_CACHE_DIR || path.join(userDataDir, 'ai_models', 'sensevoice');
   process.env.EXPORT_DIR = process.env.EXPORT_DIR || path.join(videosBaseDir, 'EZA PRO Exported');
 }
 
+function ensureWindowsKhmerFontInstalled() {
+  if (process.platform !== 'win32') return;
+  try {
+    const localAppData = process.env.LOCALAPPDATA || app.getPath('appData');
+    if (!localAppData) return;
+    const srcFont = logger.resolveUnpackedPath(path.join(__dirname, 'src', 'frontend', 'fonts', 'KantumruyPro-Bold.ttf'));
+    if (!fs.existsSync(srcFont)) return;
+    const winFontsDir = path.join(localAppData, 'Microsoft', 'Windows', 'Fonts');
+    const destFont = path.join(winFontsDir, 'KantumruyPro-Bold.ttf');
+    if (fs.existsSync(destFont)) return;
+    fs.mkdirSync(winFontsDir, { recursive: true });
+    fs.copyFileSync(srcFont, destFont);
+    const { execFile } = require('child_process');
+    execFile('reg.exe', [
+      'add',
+      'HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts',
+      '/v', 'Kantumruy Pro Bold (TrueType)',
+      '/t', 'REG_SZ',
+      '/d', destFont,
+      '/f'
+    ], { windowsHide: true }, () => { });
+  } catch (err) {
+    logger.logWarn('Main:font-install', err.message);
+  }
+}
+
 // App lifecycle
-app.whenReady().then(async () => {
-  console.log('⚡ EZA PRO starting...');
-  configurePackagedPaths();
+if (shouldRunMainApp) {
+  app.whenReady().then(async () => {
+    console.log('⚡ EZA PRO starting...');
+    configurePackagedPaths();
+    ensureWindowsKhmerFontInstalled();
+    logger.logInfo('Main:startup', `Starting EZA PRO v${app.getVersion()} (packaged=${app.isPackaged})`);
 
-  migrateLegacyGeminiAccount();
-  migrateLegacyGeminiAccountsFile();
-  migrateLegacyGeminiKey();
-
-  // Setup backend first
-  await setupBackend();
-  
-  // Then create window
-  createWindow();
-  
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+    migrateLegacyGeminiAccount();
+    if (!app.isPackaged) {
+      migrateLegacyGeminiAccountsFile();
+      migrateLegacyGeminiKey();
     }
+
+    // Setup backend first
+    await setupBackend();
+
+    // Then create window
+    createWindow();
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
+  }).catch((err) => {
+    logger.logError('Main:startup-failed', err);
+    console.error('⚡ EZA PRO failed to start:', err);
+    dialog.showErrorBox('EZA PRO startup failed', `${err.message}\n\nLog: ${logger.getLogFilePath()}`);
+    app.quit();
   });
-}).catch((err) => {
-  console.error('⚡ EZA PRO failed to start:', err);
-  dialog.showErrorBox('EZA PRO startup failed', err.message);
-  app.quit();
-});
+}
+
+let isShuttingDownBackend = false;
+function shutdownBackendAndTunnels() {
+  if (isShuttingDownBackend) return;
+  isShuttingDownBackend = true;
+  try {
+    const exportRouter = require('./src/backend/routes/export');
+    if (typeof exportRouter.cancelActiveExportProcesses === 'function') {
+      exportRouter.cancelActiveExportProcesses();
+    }
+  } catch (_) { }
+  try {
+    const audioRouter = require('./src/backend/routes/audio');
+    if (typeof audioRouter.cancelActiveBgmProcesses === 'function') {
+      audioRouter.cancelActiveBgmProcesses();
+    }
+  } catch (_) { }
+  try {
+    const translationRouter = require('./src/backend/routes/translation');
+    if (typeof translationRouter.cancelActiveSenseVoiceProcesses === 'function') {
+      translationRouter.cancelActiveSenseVoiceProcesses();
+    }
+  } catch (_) { }
+  try {
+    const voiceCloner = require('./src/backend/utils/voice-cloner');
+    if (typeof voiceCloner.cancelSeedVcInstall === 'function') {
+      voiceCloner.cancelSeedVcInstall();
+    }
+  } catch (_) { }
+  try {
+    const configRouter = require('./src/backend/routes/config');
+    if (typeof configRouter.flushUsageStats === 'function') {
+      configRouter.flushUsageStats();
+    }
+    if (typeof configRouter.stopPublicInternetTunnel === 'function') {
+      configRouter.stopPublicInternetTunnel();
+    }
+  } catch (_) { }
+  if (backendServer) {
+    try {
+      backendServer.close(() => {
+        console.log('⚡ Backend server closed');
+      });
+      if (typeof backendServer.closeAllConnections === 'function') {
+        backendServer.closeAllConnections();
+      }
+    } catch (_) { }
+  }
+}
 
 app.on('window-all-closed', () => {
-  // Close backend server
-  if (backendServer) {
-    backendServer.close(() => {
-      console.log('⚡ Backend server closed');
-    });
-  }
-  
   if (process.platform !== 'darwin') {
+    shutdownBackendAndTunnels();
     app.quit();
   }
 });
 
 app.on('before-quit', () => {
-  if (backendServer) {
-    backendServer.close();
-  }
+  shutdownBackendAndTunnels();
 });
 
+function getDialogParentWindow() {
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+}
+
 // IPC Handlers for native dialogs
-ipcMain.handle('open-folder-dialog', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openDirectory']
-  });
-  
+ipcMain.handle('open-folder-dialog', async (event, options) => {
+  const win = getDialogParentWindow();
+  const opts = { properties: ['openDirectory', 'createDirectory'] };
+  const rawDefault = options && typeof options.defaultPath === 'string' ? options.defaultPath.trim() : '';
+  if (rawDefault && path.isAbsolute(rawDefault) && fs.existsSync(rawDefault)) {
+    opts.defaultPath = rawDefault;
+  }
+  if (win && typeof win.focus === 'function') {
+    try { win.focus(); } catch (_) { }
+  }
+  const result = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
+
   if (result.canceled) {
     return null;
   }
-  
+
   return result.filePaths[0];
 });
 
 ipcMain.handle('open-file-dialog', async (event, options) => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openFile'],
-    filters: options?.filters || []
-  });
-  
+  const win = getDialogParentWindow();
+  const opts = { properties: ['openFile'], filters: options?.filters || [] };
+  const result = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
+
   if (result.canceled) {
     return null;
   }
-  
+
   return result.filePaths[0];
 });
 
 ipcMain.handle('open-files-dialog', async (event, options) => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openFile', 'multiSelections'],
-    filters: options?.filters || []
-  });
+  const win = getDialogParentWindow();
+  const opts = { properties: ['openFile', 'multiSelections'], filters: options?.filters || [] };
+  const result = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
 
   if (result.canceled) {
     return [];
@@ -468,15 +688,14 @@ ipcMain.handle('open-files-dialog', async (event, options) => {
 });
 
 ipcMain.handle('save-file-dialog', async (event, options) => {
-  const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: options?.defaultPath || 'subtitle.srt',
-    filters: options?.filters || []
-  });
-  
+  const win = getDialogParentWindow();
+  const opts = { defaultPath: options?.defaultPath || 'subtitle.srt', filters: options?.filters || [] };
+  const result = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts);
+
   if (result.canceled) {
     return null;
   }
-  
+
   return result.filePath;
 });
 
@@ -639,7 +858,56 @@ ipcMain.handle('gemini-accounts:delete', (event, accountId) => {
   return getSafeGeminiAccounts(data);
 });
 
-// Handle app updates (future)
-// Can integrate electron-updater here
+ipcMain.handle('support:open-external', async (event, targetUrl) => {
+  assertGeminiKeyRequestIsFromMainFrame(event);
+  const raw = typeof targetUrl === 'string' ? targetUrl.trim() : '';
+  if (!raw || raw.length > 1000) {
+    throw new Error('Invalid support URL.');
+  }
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (_) {
+    throw new Error('Invalid support URL.');
+  }
+  if (!['https:', 'http:', 'mailto:'].includes(parsed.protocol)) {
+    throw new Error('Blocked unsupported URL protocol.');
+  }
+  await shell.openExternal(parsed.toString());
+  return { success: true };
+});
+
+ipcMain.handle('support:reveal-logs', (event) => {
+  assertGeminiKeyRequestIsFromMainFrame(event);
+  const logFile = logger.getLogFilePath();
+  if (fs.existsSync(logFile)) {
+    shell.showItemInFolder(logFile);
+    return { success: true, path: logFile };
+  }
+  shell.openPath(logger.getLogDir());
+  return { success: true, path: logger.getLogDir() };
+});
+
+ipcMain.handle('export:open-folder', async (event, targetPath) => {
+  assertGeminiKeyRequestIsFromMainFrame(event);
+  const defaultExport = process.env.EXPORT_DIR || path.join(__dirname, 'Exported');
+  const raw = typeof targetPath === 'string' && targetPath.trim() ? targetPath.trim() : defaultExport;
+  let resolved = path.resolve(raw);
+  if (!fs.existsSync(resolved)) {
+    if (!targetPath || !String(targetPath).trim()) {
+      fs.mkdirSync(resolved, { recursive: true });
+    } else {
+      const parent = path.dirname(resolved);
+      if (fs.existsSync(parent)) resolved = parent;
+    }
+  }
+  if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+    shell.showItemInFolder(resolved);
+    return { success: true, openedPath: resolved };
+  }
+  const errStr = await shell.openPath(resolved);
+  if (errStr) throw new Error(errStr);
+  return { success: true, openedPath: resolved };
+});
 
 console.log('⚡ EZA PRO - Electron app initialized');

@@ -11,9 +11,60 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
-const { FFMPEG_BIN } = require('../utils/ffmpeg');
+const { FFMPEG_BIN, renameFileSafe, lowerProcessPriority } = require('../utils/ffmpeg');
 
 const MIN_VALID_AUDIO_BYTES = 100;
+const DEFAULT_AUDIO_SEPARATOR_MODEL = process.env.EZA_AUDIO_SEPARATOR_MODEL || 'UVR-MDX-NET-Inst_HQ_3.onnx';
+const DEFAULT_MDX_SEGMENT_SIZE = Math.max(64, Number.parseInt(process.env.EZA_MDX_SEGMENT_SIZE || '256', 10) || 256);
+const DEFAULT_MDX_OVERLAP = Math.min(0.5, Math.max(0.05, Number.parseFloat(process.env.EZA_MDX_OVERLAP || '0.1') || 0.1));
+const LONG_AUDIO_CHUNK_TRIGGER_SEC = 480;
+const AUDIO_CHUNK_DURATION_SEC = 360;
+const STEREO_WAV_BYTES_PER_SEC = 44100 * 2 * 2;
+const RESUMABLE_JOB_TTL_MS = 24 * 60 * 60 * 1000;
+
+const activeBgmProgressState = {
+  running: false,
+  key: '',
+  engine: '',
+  phase: 'idle',
+  doneChunks: 0,
+  totalChunks: 0,
+  chunkPercent: 0,
+  percent: 0,
+  statusText: '',
+  startedAt: 0,
+  updatedAt: 0
+};
+
+function updateActiveBgmProgress(patch = {}) {
+  Object.assign(activeBgmProgressState, patch, { updatedAt: Date.now() });
+}
+
+function getProjectRoot() {
+  return path.resolve(__dirname, '..', '..', '..');
+}
+
+function getAiModelsDir() {
+  const candidates = [
+    process.env.AUDIO_SEPARATOR_MODEL_DIR,
+    process.env.EZA_USER_DATA_DIR ? path.join(process.env.EZA_USER_DATA_DIR, 'ai_models', 'audio_separator') : '',
+    path.join(getProjectRoot(), '.ai_models', 'audio_separator'),
+    path.join(os.tmpdir(), 'eza-pro-ai-models', 'audio_separator')
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      return dir;
+    } catch (_) {}
+  }
+  return os.tmpdir();
+}
+
+function isAiSeparationEngine(engineId) {
+  return engineId === 'demucs' || engineId === 'audio-separator';
+}
 
 /**
  * Multi-stage stereo center vocal suppression + speech-formant notch EQ + FFT denoise.
@@ -50,14 +101,21 @@ const VOCAL_ISOLATION_FILTER = [
 let cachedSeparationEngine;
 
 function getBgmCacheDir() {
-  const dir = process.env.BGM_CACHE_DIR ||
-    (process.env.AUDIO_CACHE_DIR
-      ? path.join(process.env.AUDIO_CACHE_DIR, 'bgm_stems')
-      : path.join(__dirname, '..', '..', '..', 'bgm_cache'));
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  const candidates = [
+    process.env.BGM_CACHE_DIR,
+    process.env.AUDIO_CACHE_DIR ? path.join(process.env.AUDIO_CACHE_DIR, 'bgm_stems') : '',
+    path.join(__dirname, '..', '..', '..', 'bgm_cache'),
+    path.join(os.tmpdir(), 'eza-pro-bgm-cache')
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      return dir;
+    } catch (_) {}
   }
-  return dir;
+  return os.tmpdir();
 }
 
 function isValidAudioFile(filePath) {
@@ -73,12 +131,74 @@ function isValidAudioFile(filePath) {
  */
 function getBgmCacheKey(videoPath) {
   const normalized = path.normalize(String(videoPath || '').trim());
-  let sig = normalized;
+  const canon = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  let sig = canon;
   try {
     const stat = fs.statSync(normalized);
-    sig = `${normalized}:${stat.size}:${Math.floor(stat.mtimeMs)}`;
+    sig = `${canon}:${stat.size}:${Math.floor(stat.mtimeMs)}`;
   } catch (_) {}
   return crypto.createHash('md5').update(sig).digest('hex');
+}
+
+/**
+ * Build child process environment with bundled FFmpeg and CUDA/cuDNN DLL paths on Windows.
+ */
+function buildChildProcessEnv(extraVars = {}) {
+  const root = getProjectRoot();
+  const pathEntries = [];
+  if (FFMPEG_BIN && FFMPEG_BIN !== 'ffmpeg') {
+    const ffmpegDir = path.dirname(FFMPEG_BIN);
+    if (fs.existsSync(ffmpegDir)) pathEntries.push(ffmpegDir);
+  }
+
+  const venvRoot = path.join(root, '.venv_audio');
+  const scriptsDir = path.join(venvRoot, process.platform === 'win32' ? 'Scripts' : 'bin');
+  if (fs.existsSync(scriptsDir)) pathEntries.push(scriptsDir);
+
+  if (process.platform === 'win32') {
+    const torchLibDir = path.join(venvRoot, 'Lib', 'site-packages', 'torch', 'lib');
+    if (fs.existsSync(torchLibDir)) pathEntries.push(torchLibDir);
+    const nvidiaBase = path.join(venvRoot, 'Lib', 'site-packages', 'nvidia');
+    if (fs.existsSync(nvidiaBase)) {
+      try {
+        for (const pkg of fs.readdirSync(nvidiaBase)) {
+          const binDir = path.join(nvidiaBase, pkg, 'bin');
+          if (fs.existsSync(binDir)) pathEntries.push(binDir);
+        }
+      } catch (_) {}
+    }
+  }
+
+  const existingPath = process.env.PATH || '';
+  const mergedPath = pathEntries.length > 0
+    ? `${pathEntries.join(path.delimiter)}${existingPath ? path.delimiter + existingPath : ''}`
+    : existingPath;
+
+  const torchCandidates = [
+    process.env.TORCH_HOME,
+    process.env.EZA_USER_DATA_DIR ? path.join(process.env.EZA_USER_DATA_DIR, 'ai_models', 'torch') : '',
+    path.join(root, '.ai_models', 'torch'),
+    path.join(os.tmpdir(), 'eza-pro-torch-cache')
+  ].filter(Boolean);
+  let torchHome = os.tmpdir();
+  for (const dir of torchCandidates) {
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      torchHome = dir;
+      break;
+    } catch (_) {}
+  }
+
+  const isLowRamHost = Number(os.totalmem() || 0) > 0 && Number(os.totalmem()) <= 8.5 * 1024 * 1024 * 1024;
+  return {
+    ...process.env,
+    PATH: mergedPath,
+    AUDIO_SEPARATOR_MODEL_DIR: getAiModelsDir(),
+    TORCH_HOME: torchHome,
+    PYTHONIOENCODING: 'utf-8',
+    ...(isLowRamHost && !process.env.OMP_NUM_THREADS ? { OMP_NUM_THREADS: '2', MKL_NUM_THREADS: '2' } : {}),
+    ...extraVars
+  };
 }
 
 /**
@@ -86,24 +206,70 @@ function getBgmCacheKey(videoPath) {
  */
 function detectSeparationEngine(forceRefresh = false) {
   if (cachedSeparationEngine && !forceRefresh) {
-    return cachedSeparationEngine;
-  }
-
-  try {
-    const uvr = spawnSync('audio-separator', ['--version'], { encoding: 'utf8', timeout: 3000 });
-    if (uvr.status === 0) {
-      cachedSeparationEngine = {
-        id: 'audio-separator',
-        label: 'UVR MDX-Net AI',
-        ai: true
-      };
+    if (cachedSeparationEngine.ai || (Date.now() - (cachedSeparationEngine.checkedAt || 0) < 30000)) {
       return cachedSeparationEngine;
     }
-  } catch (_) {}
+  }
 
-  for (const [cmd, prefix] of [['demucs', []], ['py', ['-m', 'demucs']], ['python', ['-m', 'demucs']]]) {
+  const root = getProjectRoot();
+  const venvSepBin = path.join(
+    root,
+    '.venv_audio',
+    process.platform === 'win32' ? 'Scripts' : 'bin',
+    process.platform === 'win32' ? 'audio-separator.exe' : 'audio-separator'
+  );
+  const sepCandidates = [];
+  if (process.env.AUDIO_SEPARATOR_BIN) {
+    sepCandidates.push([process.env.AUDIO_SEPARATOR_BIN, []]);
+  }
+  if (fs.existsSync(venvSepBin)) {
+    sepCandidates.push([venvSepBin, []]);
+  }
+  sepCandidates.push(['audio-separator', []]);
+
+  const childEnv = buildChildProcessEnv();
+  for (const [cmd, prefix] of sepCandidates) {
     try {
-      const check = spawnSync(cmd, [...prefix, '--help'], { encoding: 'utf8', timeout: 4000 });
+      const uvr = spawnSync(cmd, [...prefix, '--version'], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 12000,
+        env: childEnv
+      });
+      if (uvr.status === 0) {
+        cachedSeparationEngine = {
+          id: 'audio-separator',
+          cmd,
+          argsPrefix: prefix,
+          model: DEFAULT_AUDIO_SEPARATOR_MODEL,
+          label: `UVR MDX-Net AI (${DEFAULT_AUDIO_SEPARATOR_MODEL.replace(/\.(onnx|ckpt|pth)$/i, '')})`,
+          ai: true
+        };
+        return cachedSeparationEngine;
+      }
+    } catch (_) {}
+  }
+
+  const venvPy = path.join(
+    root,
+    '.venv_audio',
+    process.platform === 'win32' ? 'Scripts' : 'bin',
+    process.platform === 'win32' ? 'python.exe' : 'python'
+  );
+  const demucsCandidates = [];
+  if (fs.existsSync(venvPy)) {
+    demucsCandidates.push([venvPy, ['-m', 'demucs']]);
+  }
+  demucsCandidates.push(['demucs', []], ['py', ['-m', 'demucs']], ['python', ['-m', 'demucs']]);
+
+  for (const [cmd, prefix] of demucsCandidates) {
+    try {
+      const check = spawnSync(cmd, [...prefix, '--help'], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 8000,
+        env: childEnv
+      });
       if (check.status === 0) {
         cachedSeparationEngine = {
           id: 'demucs',
@@ -120,50 +286,618 @@ function detectSeparationEngine(forceRefresh = false) {
   cachedSeparationEngine = {
     id: 'ffmpeg_dsp',
     label: 'FFmpeg Multi-Band & Stereo Vocal Suppressor',
-    ai: false
+    ai: false,
+    checkedAt: Date.now()
   };
   return cachedSeparationEngine;
 }
 
-function probeHasAudio(filePath) {
+function buildBgmFilterForChannels(channels = 2) {
+  if (channels === 1) {
+    return BGM_ISOLATION_FILTER.replace(',stereotools=mlev=0.04:slev=1.25', '');
+  }
+  return BGM_ISOLATION_FILTER;
+}
+
+function buildVocalFilterForChannels(channels = 2) {
+  if (channels === 1) {
+    return VOCAL_ISOLATION_FILTER.replace(',stereotools=mlev=1.2:slev=0.15', '');
+  }
+  return VOCAL_ISOLATION_FILTER;
+}
+
+function probeAudioInfo(filePath) {
   return new Promise((resolve) => {
-    const proc = spawn(FFMPEG_BIN, ['-hide_banner', '-i', filePath], { windowsHide: true });
+    let settled = false;
+    const proc = spawn(FFMPEG_BIN, ['-nostdin', '-hide_banner', '-i', filePath], {
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
     let stderr = '';
-    proc.stderr.on('data', d => { stderr += d.toString(); });
-    proc.on('error', () => resolve(false));
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch (_) { try { proc.kill(); } catch (_) {} }
+      finish({ hasAudio: false, channels: 2 });
+    }, 8000);
+    proc.stderr.on('data', d => {
+      if (stderr.length < 16384) stderr += d.toString();
+    });
+    proc.on('error', () => finish({ hasAudio: false, channels: 2 }));
     proc.on('close', () => {
-      resolve(/Stream #\d+:\d+[^:]*:\s*Audio:/m.test(stderr));
+      const audioLineMatch = stderr.match(/Stream #\d+:\d+[^:]*:\s*Audio:([^\r\n]*)/m);
+      if (!audioLineMatch) return finish({ hasAudio: false, channels: 0 });
+      const channels = /\bmono\b|\b1 channels?\b/i.test(audioLineMatch[1]) ? 1 : 2;
+      finish({ hasAudio: true, channels });
     });
   });
 }
 
-function runFfmpegExtract(inputPath, filterGraph, outPath, bitrate = '192k') {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-y',
-      '-i', inputPath,
-      '-vn',
-      '-af', filterGraph,
-      '-c:a', 'libmp3lame',
-      '-b:a', bitrate,
-      outPath
-    ];
-    const proc = spawn(FFMPEG_BIN, args, { windowsHide: true });
-    let stderr = '';
-    proc.stderr.on('data', d => { stderr += d.toString(); });
-    proc.on('error', reject);
-    proc.on('close', (code) => {
-      if (code === 0 && isValidAudioFile(outPath)) {
-        return resolve();
+function probeHasAudio(filePath) {
+  return probeAudioInfo(filePath).then(info => Boolean(info && info.hasAudio));
+}
+
+function createBgmWorkTempDir(prefix = '_tmp_sep_') {
+  const baseDir = getBgmCacheDir();
+  return fs.mkdtempSync(path.join(baseDir, prefix));
+}
+
+function cleanupStaleBgmTempDirs() {
+  try {
+    const baseDir = getBgmCacheDir();
+    const now = Date.now();
+    for (const entry of fs.readdirSync(baseDir)) {
+      if (!entry.startsWith('_tmp_')) continue;
+      const fullPath = path.join(baseDir, entry);
+      try {
+        const st = fs.statSync(fullPath);
+        if (st.isDirectory() && (now - st.mtimeMs) > RESUMABLE_JOB_TTL_MS) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+function createBgmCancelledError() {
+  return Object.assign(new Error('BGM isolation cancelled by user'), { cancelled: true });
+}
+
+function attachCancelWatcher(proc, isCancelled, onCancel) {
+  if (typeof isCancelled !== 'function') return () => {};
+  const id = setInterval(() => {
+    try {
+      if (isCancelled()) {
+        clearInterval(id);
+        killProcessTree(proc);
+        onCancel();
       }
-      reject(new Error(`FFmpeg stem extraction failed (code ${code}): ${stderr.slice(-400)}`));
+    } catch (_) {}
+  }, 400);
+  if (typeof id.unref === 'function') id.unref();
+  return () => clearInterval(id);
+}
+
+function runFfmpegCommand(args, label = 'FFmpeg', timeoutMs = 10 * 60 * 1000, hooks = {}) {
+  return new Promise((resolve, reject) => {
+    if (hooks.isCancelled && hooks.isCancelled()) {
+      return reject(createBgmCancelledError());
+    }
+    let settled = false;
+    const proc = spawn(FFMPEG_BIN, ['-nostdin', '-hide_banner', '-loglevel', 'error', ...args], {
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
+    lowerProcessPriority(proc);
+    if (typeof hooks.onProcess === 'function') {
+      try { hooks.onProcess(proc); } catch (_) {}
+    }
+    let stderr = '';
+    let stopCancelWatch = () => {};
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stopCancelWatch();
+      if (err) reject(err);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      killProcessTree(proc);
+      finish(new Error(`${label} timed out`));
+    }, timeoutMs);
+    stopCancelWatch = attachCancelWatcher(proc, hooks.isCancelled, () => finish(createBgmCancelledError()));
+    proc.stderr.on('data', d => {
+      if (stderr.length < 16384) stderr += d.toString();
+      else stderr = (stderr + d.toString()).slice(-16384);
+    });
+    proc.on('error', (err) => finish(err));
+    proc.on('close', (code) => {
+      if (hooks.isCancelled && hooks.isCancelled()) return finish(createBgmCancelledError());
+      if (code === 0) return finish();
+      finish(new Error(`${label} failed (code ${code}): ${stderr.slice(-400)}`));
     });
   });
 }
 
-function runDemucsSeparation(videoPath, bgmOutPath, vocalsOutPath, engineSpec) {
+async function runFfmpegExtract(inputPath, filterGraph, outPath, bitrate = '192k', hooks = {}) {
+  await runFfmpegCommand([
+    '-y',
+    '-i', inputPath,
+    '-vn',
+    '-af', filterGraph,
+    '-c:a', 'libmp3lame',
+    '-b:a', bitrate,
+    outPath
+  ], 'FFmpeg stem extraction', 10 * 60 * 1000, hooks);
+  if (!isValidAudioFile(outPath)) {
+    throw new Error('FFmpeg stem extraction produced an empty output file');
+  }
+}
+
+function estimateWavDurationSec(wavPath) {
+  try {
+    const size = fs.statSync(wavPath).size;
+    return Math.max(0, (size - 44) / STEREO_WAV_BYTES_PER_SEC);
+  } catch (_) {
+    return 0;
+  }
+}
+
+function findStemFilesInDir(dirPath, baseName = null) {
+  if (!fs.existsSync(dirPath)) return { bgmFile: null, vocalsFile: null };
+  const files = fs.readdirSync(dirPath).filter(f => /\.(wav|flac|mp3)$/i.test(f));
+  let bgmFile;
+  let vocalsFile;
+  if (baseName) {
+    const bgmPrefix = `${baseName}_(Instrumental)`;
+    const vocPrefix = `${baseName}_(Vocals)`;
+    bgmFile = files.find(f => f.startsWith(bgmPrefix));
+    vocalsFile = files.find(f => f.startsWith(vocPrefix));
+  } else {
+    bgmFile = files.find(f => /^bgm\.(wav|flac|mp3)$/i.test(f)) ||
+      files.find(f => /\(Instrumental\)|no_vocals/i.test(f));
+    vocalsFile = files.find(f => /^vocals\.(wav|flac|mp3)$/i.test(f)) ||
+      files.find(f => /\(Vocals\)/i.test(f) && !/no_vocals/i.test(f));
+  }
+  return {
+    bgmFile: bgmFile ? path.join(dirPath, bgmFile) : null,
+    vocalsFile: vocalsFile ? path.join(dirPath, vocalsFile) : null
+  };
+}
+
+function killProcessTree(proc) {
+  if (!proc) return;
+  try {
+    if (process.platform === 'win32' && proc.pid) {
+      spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      return;
+    }
+  } catch (_) {}
+  try { proc.kill('SIGKILL'); } catch (_) {}
+}
+
+function isRealAudioSeparatorEngine(engineSpec) {
+  return Boolean(
+    engineSpec &&
+    engineSpec.cmd !== process.execPath &&
+    (!Array.isArray(engineSpec.argsPrefix) || engineSpec.argsPrefix.length === 0)
+  );
+}
+
+function runAudioSeparatorChunk(inputWavPath, chunkOutDir, engineSpec, env, hooks = {}) {
   return new Promise((resolve, reject) => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eza-demucs-'));
+    if (hooks.isCancelled && hooks.isCancelled()) {
+      return reject(createBgmCancelledError());
+    }
+    const customNames = JSON.stringify({ Instrumental: 'bgm', Vocals: 'vocals' });
+    const useFastNativeFlags = isRealAudioSeparatorEngine(engineSpec);
+    const isLowRamHost = Number(os.totalmem() || 0) > 0 && Number(os.totalmem()) <= 8.5 * 1024 * 1024 * 1024;
+    const mdxSegmentSize = process.env.EZA_MDX_SEGMENT_SIZE
+      ? DEFAULT_MDX_SEGMENT_SIZE
+      : (isLowRamHost ? Math.min(128, DEFAULT_MDX_SEGMENT_SIZE) : DEFAULT_MDX_SEGMENT_SIZE);
+    const args = [
+      ...(engineSpec.argsPrefix || []),
+      '-m', engineSpec.model || DEFAULT_AUDIO_SEPARATOR_MODEL,
+      '--model_file_dir', getAiModelsDir(),
+      '--output_dir', chunkOutDir,
+      '--output_format', 'WAV',
+      ...(useFastNativeFlags ? ['--use_soundfile', '--mdx_overlap', String(DEFAULT_MDX_OVERLAP)] : []),
+      '--mdx_segment_size', String(mdxSegmentSize),
+      '--custom_output_names', customNames,
+      inputWavPath
+    ];
+    const proc = spawn(engineSpec.cmd || 'audio-separator', args, { windowsHide: true, env });
+    lowerProcessPriority(proc);
+    if (typeof hooks.onProcess === 'function') {
+      try { hooks.onProcess(proc); } catch (_) {}
+    }
+    let combinedErr = '';
+    let settled = false;
+    let stopCancelWatch = () => {};
+    let lastTqdmPct = 0;
+    let subBar = 0;
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stopCancelWatch();
+      if (err) reject(err);
+      else resolve(val);
+    };
+    const timer = setTimeout(() => {
+      killProcessTree(proc);
+      finish(new Error('audio-separator chunk timed out after 10 minutes'));
+    }, 10 * 60 * 1000);
+    stopCancelWatch = attachCancelWatcher(proc, hooks.isCancelled, () => finish(createBgmCancelledError()));
+    const appendTail = (d) => {
+      const str = d.toString();
+      combinedErr += str;
+      if (combinedErr.length > 16384) combinedErr = combinedErr.slice(-8192);
+      if (typeof hooks.onChunkPercent === 'function') {
+        const matches = str.match(/(\d{1,3})%\|/g);
+        if (matches && matches.length > 0) {
+          const pct = Math.min(100, Math.max(0, parseInt(matches[matches.length - 1], 10) || 0));
+          if (pct + 30 < lastTqdmPct) subBar = 1;
+          lastTqdmPct = pct;
+          const mapped = subBar === 0 ? Math.round(pct * 0.8) : (80 + Math.round(pct * 0.18));
+          hooks.onChunkPercent(Math.min(99, mapped));
+        }
+      }
+    };
+    if (proc.stdout) proc.stdout.on('data', appendTail);
+    if (proc.stderr) proc.stderr.on('data', appendTail);
+    proc.on('error', (err) => finish(err));
+    proc.on('close', (code) => {
+      if (hooks.isCancelled && hooks.isCancelled()) return finish(createBgmCancelledError());
+      if (code !== 0) {
+        return finish(new Error(`audio-separator exited with code ${code}: ${combinedErr.slice(-500)}`));
+      }
+      const stems = findStemFilesInDir(chunkOutDir);
+      if (!stems.bgmFile || !stems.vocalsFile || !isValidAudioFile(stems.bgmFile) || !isValidAudioFile(stems.vocalsFile)) {
+        return finish(new Error(`audio-separator stems not found in ${chunkOutDir}`));
+      }
+      finish(null, stems);
+    });
+  });
+}
+
+function runAudioSeparatorBatch(pendingChunks, batchOutDir, engineSpec, env, hooks = {}) {
+  return new Promise((resolve, reject) => {
+    if (hooks.isCancelled && hooks.isCancelled()) {
+      return reject(createBgmCancelledError());
+    }
+    const inputPaths = pendingChunks.map(c => c.path);
+    const args = [
+      ...(engineSpec.argsPrefix || []),
+      '-m', engineSpec.model || DEFAULT_AUDIO_SEPARATOR_MODEL,
+      '--model_file_dir', getAiModelsDir(),
+      '--output_dir', batchOutDir,
+      '--output_format', 'WAV',
+      '--use_soundfile',
+      '--mdx_segment_size', String(DEFAULT_MDX_SEGMENT_SIZE),
+      '--mdx_overlap', String(DEFAULT_MDX_OVERLAP),
+      ...inputPaths
+    ];
+    const proc = spawn(engineSpec.cmd || 'audio-separator', args, { windowsHide: true, env });
+    lowerProcessPriority(proc);
+    if (typeof hooks.onProcess === 'function') {
+      try { hooks.onProcess(proc); } catch (_) {}
+    }
+    let combinedErr = '';
+    let settled = false;
+    let stopCancelWatch = () => {};
+    let activePendingIdx = 0;
+    let lastTqdmPct = 0;
+    let subBar = 0;
+    const baseToPendingIdx = new Map(pendingChunks.map((c, idx) => [c.baseName.toLowerCase(), idx]));
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stopCancelWatch();
+      if (err) reject(err);
+      else resolve();
+    };
+    const timeoutMs = Math.max(15 * 60 * 1000, pendingChunks.length * 8 * 60 * 1000);
+    const timer = setTimeout(() => {
+      killProcessTree(proc);
+      finish(new Error('audio-separator batch timed out'));
+    }, timeoutMs);
+    stopCancelWatch = attachCancelWatcher(proc, hooks.isCancelled, () => finish(createBgmCancelledError()));
+    const handleOutput = (d) => {
+      const str = d.toString();
+      combinedErr += str;
+      if (combinedErr.length > 16384) combinedErr = combinedErr.slice(-8192);
+      const procMatch = str.match(/Processing file:\s*([^\r\n]+)/i);
+      if (procMatch) {
+        const foundBase = path.basename(procMatch[1].trim(), path.extname(procMatch[1].trim())).toLowerCase();
+        if (baseToPendingIdx.has(foundBase)) {
+          activePendingIdx = baseToPendingIdx.get(foundBase);
+          lastTqdmPct = 0;
+          subBar = 0;
+          if (typeof hooks.onBatchProgress === 'function') {
+            hooks.onBatchProgress(activePendingIdx, 0);
+          }
+        }
+      }
+      if (typeof hooks.onBatchProgress === 'function') {
+        const matches = str.match(/(\d{1,3})%\|/g);
+        if (matches && matches.length > 0) {
+          const pct = Math.min(100, Math.max(0, parseInt(matches[matches.length - 1], 10) || 0));
+          if (pct + 30 < lastTqdmPct) subBar = 1;
+          lastTqdmPct = pct;
+          const mapped = subBar === 0 ? Math.round(pct * 0.8) : (80 + Math.round(pct * 0.18));
+          hooks.onBatchProgress(activePendingIdx, Math.min(99, mapped));
+        }
+      }
+    };
+    if (proc.stdout) proc.stdout.on('data', handleOutput);
+    if (proc.stderr) proc.stderr.on('data', handleOutput);
+    proc.on('error', (err) => finish(err));
+    proc.on('close', (code) => {
+      if (hooks.isCancelled && hooks.isCancelled()) return finish(createBgmCancelledError());
+      if (code !== 0) {
+        return finish(new Error(`audio-separator exited with code ${code}: ${combinedErr.slice(-500)}`));
+      }
+      finish();
+    });
+  });
+}
+
+async function concatWavListToMp3(wavPaths, outMp3Path, bitrate, listPath, hooks = {}) {
+  if (wavPaths.length === 1) {
+    await runFfmpegCommand([
+      '-y', '-i', wavPaths[0], '-c:a', 'libmp3lame', '-b:a', bitrate, outMp3Path
+    ], 'FFmpeg encode stem', 10 * 60 * 1000, hooks);
+  } else {
+    const listBody = wavPaths.map(p => `file '${p.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`).join('\n');
+    fs.writeFileSync(listPath, listBody, 'utf8');
+    await runFfmpegCommand([
+      '-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c:a', 'libmp3lame', '-b:a', bitrate, outMp3Path
+    ], 'FFmpeg concat stem', 15 * 60 * 1000, hooks);
+  }
+  if (!isValidAudioFile(outMp3Path)) {
+    throw new Error(`Separated stem MP3 is invalid: ${outMp3Path}`);
+  }
+}
+
+/**
+ * Run UVR audio-separator with FFmpeg WAV normalization, single-process multi-chunk batching,
+ * resumable chunk checkpoints, and live chunk progress reporting.
+ */
+async function runAudioSeparatorSeparation(videoPath, bgmOutPath, vocalsOutPath, engineSpec, options = {}) {
+  const resumableKey = options.resumableKey ? String(options.resumableKey).trim() : '';
+  const tempDir = resumableKey
+    ? path.join(getBgmCacheDir(), `_tmp_uvr_job_${resumableKey}`)
+    : createBgmWorkTempDir('_tmp_uvr_');
+  if (resumableKey && options.cleanResume && fs.existsSync(tempDir)) {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+  }
+  fs.mkdirSync(tempDir, { recursive: true });
+  const pyTmpDir = path.join(tempDir, 'pytmp');
+  fs.mkdirSync(pyTmpDir, { recursive: true });
+  const env = buildChildProcessEnv({ TMP: pyTmpDir, TEMP: pyTmpDir });
+  const chunkTriggerSec = Number(options.chunkTriggerSec) > 0 ? Number(options.chunkTriggerSec) : LONG_AUDIO_CHUNK_TRIGGER_SEC;
+  const chunkDurationSec = Number(options.chunkDurationSec) > 0 ? Number(options.chunkDurationSec) : AUDIO_CHUNK_DURATION_SEC;
+
+  const reportProgress = (phase, doneChunks, totalChunks, chunkPercent, statusText) => {
+    const safeTotal = Math.max(1, totalChunks || 1);
+    const frac = Math.min(1, Math.max(0, (doneChunks + (chunkPercent || 0) / 100) / safeTotal));
+    const overallPct = phase === 'decode'
+      ? 3
+      : (phase === 'concat' ? 95 : Math.min(94, 6 + Math.round(frac * 86)));
+    const payload = { phase, doneChunks, totalChunks: safeTotal, chunkPercent: Math.round(chunkPercent || 0), percent: overallPct, statusText };
+    if (typeof options.onProgress === 'function') {
+      try { options.onProgress(payload); } catch (_) {}
+    }
+  };
+  const checkCancelled = () => {
+    if (typeof options.isCancelled === 'function' && options.isCancelled()) {
+      throw createBgmCancelledError();
+    }
+  };
+  const ffmpegHooks = { isCancelled: options.isCancelled, onProcess: options.onProcess };
+
+  let succeeded = false;
+  try {
+    checkCancelled();
+    const sourceWav = path.join(tempDir, 'source.wav');
+    const sourceMetaFile = path.join(tempDir, 'source.meta.json');
+    let srcSize = 0;
+    try { srcSize = fs.statSync(videoPath).size; } catch (_) {}
+    let canReuseChunks = false;
+    if (resumableKey && isValidAudioFile(sourceWav) && fs.existsSync(sourceMetaFile)) {
+      try {
+        const prevMeta = JSON.parse(fs.readFileSync(sourceMetaFile, 'utf8'));
+        if (prevMeta && prevMeta.size === srcSize && prevMeta.chunkDurationSec === chunkDurationSec && prevMeta.model === engineSpec.model) {
+          canReuseChunks = true;
+        }
+      } catch (_) {}
+    }
+
+    if (!canReuseChunks) {
+      reportProgress('decode', 0, 1, 0, '🎵 កំពុងស្រង់សំឡេងដើមពីវីដេអូសម្រាប់ UVR AI...');
+      await runFfmpegCommand([
+        '-y', '-i', videoPath, '-vn', '-ac', '2', '-ar', '44100', '-c:a', 'pcm_s16le', sourceWav
+      ], 'FFmpeg audio decode', 10 * 60 * 1000, ffmpegHooks);
+    }
+    checkCancelled();
+
+    const durSec = estimateWavDurationSec(sourceWav);
+    const chunkFiles = [];
+    const splitDir = path.join(tempDir, 'chunks');
+    if (durSec > chunkTriggerSec) {
+      fs.mkdirSync(splitDir, { recursive: true });
+      const existingChunks = canReuseChunks
+        ? fs.readdirSync(splitDir).filter(f => f.endsWith('.wav')).sort()
+        : [];
+      if (existingChunks.length === 0) {
+        reportProgress('decode', 0, 1, 50, '🎵 កំពុងបែងចែកសំឡេងជាវគ្គតូចៗ (4GB VRAM safe)...');
+        await runFfmpegCommand([
+          '-y', '-i', sourceWav, '-f', 'segment', '-segment_time', String(chunkDurationSec), '-c', 'copy',
+          path.join(splitDir, 'chunk_%03d.wav')
+        ], 'FFmpeg split audio chunks', 10 * 60 * 1000, ffmpegHooks);
+      }
+      for (const f of fs.readdirSync(splitDir).sort()) {
+        if (f.endsWith('.wav')) chunkFiles.push(path.join(splitDir, f));
+      }
+      console.log(`[audio/isolate-bgm] UVR chunked separation: ${chunkFiles.length} chunks for ${Math.round(durSec)}s audio`);
+    } else {
+      chunkFiles.push(sourceWav);
+    }
+    if (resumableKey) {
+      try { fs.writeFileSync(sourceMetaFile, JSON.stringify({ size: srcSize, chunkDurationSec, model: engineSpec.model }), 'utf8'); } catch (_) {}
+    }
+    checkCancelled();
+
+    const totalChunks = chunkFiles.length;
+    const bgmWavs = new Array(totalChunks).fill(null);
+    const vocalsWavs = new Array(totalChunks).fill(null);
+    const batchOutDir = path.join(tempDir, 'batch_out');
+    fs.mkdirSync(batchOutDir, { recursive: true });
+
+    const useBatch = isRealAudioSeparatorEngine(engineSpec) && totalChunks > 1;
+    if (useBatch) {
+      const pendingChunks = [];
+      let preCompletedCount = 0;
+      for (let i = 0; i < totalChunks; i++) {
+        const baseName = path.basename(chunkFiles[i], path.extname(chunkFiles[i]));
+        const batchStems = findStemFilesInDir(batchOutDir, baseName);
+        const perChunkStems = (!batchStems.bgmFile || !batchStems.vocalsFile) && resumableKey
+          ? findStemFilesInDir(path.join(tempDir, `out_${i}`))
+          : { bgmFile: null, vocalsFile: null };
+        const existingStems = (batchStems.bgmFile && batchStems.vocalsFile) ? batchStems : perChunkStems;
+        if (existingStems.bgmFile && existingStems.vocalsFile && isValidAudioFile(existingStems.bgmFile) && isValidAudioFile(existingStems.vocalsFile)) {
+          bgmWavs[i] = existingStems.bgmFile;
+          vocalsWavs[i] = existingStems.vocalsFile;
+          preCompletedCount++;
+        } else {
+          pendingChunks.push({ index: i, path: chunkFiles[i], baseName });
+        }
+      }
+
+      if (pendingChunks.length > 0) {
+        reportProgress(
+          'separate',
+          preCompletedCount,
+          totalChunks,
+          0,
+          `🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU) [វគ្គ ${Math.min(totalChunks, preCompletedCount + 1)}/${totalChunks}]...`
+        );
+        try {
+          await runAudioSeparatorBatch(pendingChunks, batchOutDir, engineSpec, env, {
+            isCancelled: options.isCancelled,
+            onProcess: options.onProcess,
+            onBatchProgress: (pendingIdx, chunkPct) => {
+              const doneSoFar = Math.min(totalChunks - 1, preCompletedCount + pendingIdx);
+              const curNum = Math.min(totalChunks, doneSoFar + 1);
+              reportProgress(
+                'separate',
+                doneSoFar,
+                totalChunks,
+                chunkPct,
+                `🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU) [វគ្គ ${curNum}/${totalChunks} · ${chunkPct}%]...`
+              );
+            }
+          });
+        } catch (batchErr) {
+          if (batchErr && batchErr.cancelled) throw batchErr;
+          console.warn('[audio/isolate-bgm] UVR batch mode fallback to per-chunk:', batchErr.message);
+        }
+      }
+
+      // Collect batch outputs & fill any remaining chunks individually
+      for (let i = 0; i < totalChunks; i++) {
+        if (bgmWavs[i] && vocalsWavs[i]) continue;
+        const baseName = path.basename(chunkFiles[i], path.extname(chunkFiles[i]));
+        const stems = findStemFilesInDir(batchOutDir, baseName);
+        if (stems.bgmFile && stems.vocalsFile && isValidAudioFile(stems.bgmFile) && isValidAudioFile(stems.vocalsFile)) {
+          bgmWavs[i] = stems.bgmFile;
+          vocalsWavs[i] = stems.vocalsFile;
+        } else {
+          checkCancelled();
+          reportProgress(
+            'separate',
+            i,
+            totalChunks,
+            0,
+            `🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU) [វគ្គ ${i + 1}/${totalChunks}]...`
+          );
+          const chunkOutDir = path.join(tempDir, `out_${i}`);
+          fs.mkdirSync(chunkOutDir, { recursive: true });
+          const singleStems = await runAudioSeparatorChunk(chunkFiles[i], chunkOutDir, engineSpec, env, {
+            isCancelled: options.isCancelled,
+            onProcess: options.onProcess,
+            onChunkPercent: (chunkPct) => {
+              reportProgress(
+                'separate',
+                i,
+                totalChunks,
+                chunkPct,
+                `🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU) [វគ្គ ${i + 1}/${totalChunks} · ${chunkPct}%]...`
+              );
+            }
+          });
+          bgmWavs[i] = singleStems.bgmFile;
+          vocalsWavs[i] = singleStems.vocalsFile;
+        }
+      }
+    } else {
+      for (let i = 0; i < totalChunks; i++) {
+        checkCancelled();
+        const chunkOutDir = path.join(tempDir, `out_${i}`);
+        const existingSingle = resumableKey ? findStemFilesInDir(chunkOutDir) : { bgmFile: null, vocalsFile: null };
+        if (existingSingle.bgmFile && existingSingle.vocalsFile && isValidAudioFile(existingSingle.bgmFile) && isValidAudioFile(existingSingle.vocalsFile)) {
+          bgmWavs[i] = existingSingle.bgmFile;
+          vocalsWavs[i] = existingSingle.vocalsFile;
+          reportProgress('separate', i + 1, totalChunks, 0, `🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU) [វគ្គ ${i + 1}/${totalChunks} · 100%]...`);
+          continue;
+        }
+        fs.mkdirSync(chunkOutDir, { recursive: true });
+        reportProgress('separate', i, totalChunks, 0, `🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU) [វគ្គ ${i + 1}/${totalChunks}]...`);
+        const stems = await runAudioSeparatorChunk(chunkFiles[i], chunkOutDir, engineSpec, env, {
+          isCancelled: options.isCancelled,
+          onProcess: options.onProcess,
+          onChunkPercent: (chunkPct) => {
+            reportProgress(
+              'separate',
+              i,
+              totalChunks,
+              chunkPct,
+              `🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU) [វគ្គ ${i + 1}/${totalChunks} · ${chunkPct}%]...`
+            );
+          }
+        });
+        bgmWavs[i] = stems.bgmFile;
+        vocalsWavs[i] = stems.vocalsFile;
+      }
+    }
+
+    checkCancelled();
+    reportProgress('concat', totalChunks, totalChunks, 0, '🎵 កំពុងផ្គុំភ្លេង BGM+SFX ទៅជា MP3...');
+    await Promise.all([
+      concatWavListToMp3(bgmWavs, bgmOutPath, '192k', path.join(tempDir, 'bgm_concat.txt'), ffmpegHooks),
+      concatWavListToMp3(vocalsWavs, vocalsOutPath, '160k', path.join(tempDir, 'vocals_concat.txt'), ffmpegHooks)
+    ]);
+    succeeded = true;
+  } finally {
+    if (!resumableKey || succeeded) {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  }
+}
+
+function runDemucsSeparation(videoPath, bgmOutPath, vocalsOutPath, engineSpec, hooks = {}) {
+  return new Promise((resolve, reject) => {
+    if (hooks.isCancelled && hooks.isCancelled()) {
+      return reject(createBgmCancelledError());
+    }
+    const tempDir = createBgmWorkTempDir('_tmp_demucs_');
     const args = [
       ...(engineSpec.argsPrefix || []),
       '--two-stems=vocals',
@@ -172,15 +906,45 @@ function runDemucsSeparation(videoPath, bgmOutPath, vocalsOutPath, engineSpec) {
       '-o', tempDir,
       videoPath
     ];
-    const proc = spawn(engineSpec.cmd || 'demucs', args, { windowsHide: true });
+    const proc = spawn(engineSpec.cmd || 'demucs', args, { windowsHide: true, env: buildChildProcessEnv({ TMP: tempDir, TEMP: tempDir }) });
+    lowerProcessPriority(proc);
+    if (typeof hooks.onProcess === 'function') {
+      try { hooks.onProcess(proc); } catch (_) {}
+    }
     let stderr = '';
-    proc.stderr.on('data', d => { stderr += d.toString(); });
+    let settled = false;
+    let stopCancelWatch = () => {};
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stopCancelWatch();
+      if (err) reject(err);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      killProcessTree(proc);
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
+      finish(new Error('Demucs timed out after 15 minutes'));
+    }, 15 * 60 * 1000);
+    stopCancelWatch = attachCancelWatcher(proc, hooks.isCancelled, () => finish(createBgmCancelledError()));
+    if (proc.stdout) proc.stdout.resume();
+    if (proc.stderr) {
+      proc.stderr.on('data', d => {
+        stderr += d.toString();
+        if (stderr.length > 16384) stderr = stderr.slice(-8192);
+      });
+    }
     proc.on('error', (err) => {
       try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
-      reject(err);
+      finish(err);
     });
     proc.on('close', (code) => {
       try {
+        if (settled) return;
+        if (hooks.isCancelled && hooks.isCancelled()) {
+          throw createBgmCancelledError();
+        }
         if (code !== 0) {
           throw new Error(`Demucs exited with code ${code}: ${stderr.slice(-300)}`);
         }
@@ -193,9 +957,9 @@ function runDemucsSeparation(videoPath, bgmOutPath, vocalsOutPath, engineSpec) {
         }
         fs.copyFileSync(noVocals, bgmOutPath);
         fs.copyFileSync(vocals, vocalsOutPath);
-        resolve();
+        finish();
       } catch (e) {
-        reject(e);
+        finish(e);
       } finally {
         try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (_) {}
       }
@@ -236,8 +1000,11 @@ function getCachedStemsForVideo(videoPath) {
   };
 }
 
+const inFlightBgmJobs = new Map();
+
 /**
- * Isolate BGM (no_vocals) and Vocals stems for a video file, with caching.
+ * Isolate BGM (no_vocals) and Vocals stems for a video file, with caching,
+ * in-flight deduplication + shared progress/cancellation listeners.
  */
 async function isolateVideoBgm(videoPath, options = {}) {
   const normalized = path.normalize(String(videoPath || '').trim());
@@ -247,56 +1014,236 @@ async function isolateVideoBgm(videoPath, options = {}) {
   const vocalsPath = path.join(cacheDir, `${key}_vocals.mp3`);
   const metaPath = path.join(cacheDir, `${key}_meta.json`);
 
+  const detected = detectSeparationEngine();
   if (!options.force) {
     const existing = getCachedStemsForVideo(normalized);
-    if (existing) {
+    const shouldUpgradeCachedDsp =
+      existing &&
+      !isAiSeparationEngine(existing.engine) &&
+      options.engine !== 'ffmpeg_dsp' &&
+      isAiSeparationEngine(detected.id);
+    if (existing && !shouldUpgradeCachedDsp) {
       return { ...existing, cached: true };
     }
   }
 
-  const hasAudio = await probeHasAudio(normalized);
-  if (!hasAudio) {
-    const err = new Error('វីដេអូនេះគ្មានសំឡេងសម្រាប់បំបែក BGM ទេ។');
-    err.statusCode = 422;
-    throw err;
-  }
-
-  const detected = detectSeparationEngine();
-  let usedEngine = 'ffmpeg_dsp';
-
-  if (detected.id === 'demucs' && options.engine !== 'ffmpeg_dsp') {
-    try {
-      await runDemucsSeparation(normalized, bgmPath, vocalsPath, detected);
-      usedEngine = 'demucs';
-    } catch (e) {
-      console.warn('[audio/isolate-bgm] Demucs fallback to FFmpeg DSP:', e.message);
+  const requestedEngine = String(options.engine || 'auto');
+  const jobKey = `${key}|eng=${requestedEngine}`;
+  if (!options.force) {
+    const existingRecord = inFlightBgmJobs.get(jobKey);
+    if (existingRecord) {
+      if (typeof options.onProgress === 'function') {
+        existingRecord.progressListeners.add(options.onProgress);
+        if (existingRecord.lastProgress) {
+          try { options.onProgress(existingRecord.lastProgress); } catch (_) {}
+        }
+      }
+      if (typeof options.isCancelled === 'function') {
+        existingRecord.cancelCheckers.add(options.isCancelled);
+      }
+      if (typeof options.onProcess === 'function') {
+        existingRecord.processListeners.add(options.onProcess);
+        for (const p of existingRecord.activeProcs) {
+          try { options.onProcess(p); } catch (_) {}
+        }
+      }
+      try {
+        return await existingRecord.promise;
+      } finally {
+        if (typeof options.onProgress === 'function') existingRecord.progressListeners.delete(options.onProgress);
+        if (typeof options.isCancelled === 'function') existingRecord.cancelCheckers.delete(options.isCancelled);
+        if (typeof options.onProcess === 'function') existingRecord.processListeners.delete(options.onProcess);
+      }
     }
   }
 
-  if (usedEngine === 'ffmpeg_dsp') {
-    await Promise.all([
-      runFfmpegExtract(normalized, BGM_ISOLATION_FILTER, bgmPath, '192k'),
-      runFfmpegExtract(normalized, VOCAL_ISOLATION_FILTER, vocalsPath, '160k')
-    ]);
-  }
-
-  try {
-    fs.writeFileSync(metaPath, JSON.stringify({
-      engine: usedEngine,
-      videoPath: normalized,
-      createdAt: new Date().toISOString()
-    }, null, 2), 'utf8');
-  } catch (_) {}
-
-  return {
-    cached: false,
-    key,
-    engine: usedEngine,
-    bgmPath,
-    vocalsPath,
-    bgmUrl: `/bgm_cache/${key}_bgm.mp3`,
-    vocalsUrl: `/bgm_cache/${key}_vocals.mp3`
+  const record = {
+    progressListeners: new Set(),
+    cancelCheckers: new Set(),
+    processListeners: new Set(),
+    activeProcs: new Set(),
+    lastProgress: null,
+    promise: null
   };
+  if (typeof options.onProgress === 'function') record.progressListeners.add(options.onProgress);
+  if (typeof options.isCancelled === 'function') record.cancelCheckers.add(options.isCancelled);
+  if (typeof options.onProcess === 'function') record.processListeners.add(options.onProcess);
+
+  const emitProgress = (info) => {
+    record.lastProgress = info;
+    updateActiveBgmProgress({
+      running: true,
+      key,
+      engine: detected.id,
+      phase: info.phase || 'separate',
+      doneChunks: info.doneChunks || 0,
+      totalChunks: info.totalChunks || 1,
+      chunkPercent: info.chunkPercent || 0,
+      percent: info.percent || 0,
+      statusText: info.statusText || ''
+    });
+    for (const fn of record.progressListeners) {
+      try { fn(info); } catch (_) {}
+    }
+  };
+  const checkCancelledAny = () => {
+    for (const fn of record.cancelCheckers) {
+      try {
+        if (fn()) return true;
+      } catch (_) {}
+    }
+    return false;
+  };
+  const registerProc = (proc) => {
+    if (!proc) return;
+    record.activeProcs.add(proc);
+    proc.once('close', () => record.activeProcs.delete(proc));
+    for (const fn of record.processListeners) {
+      try { fn(proc); } catch (_) {}
+    }
+  };
+
+  cleanupStaleBgmTempDirs();
+
+  const jobPromise = (async () => {
+    updateActiveBgmProgress({
+      running: true,
+      key,
+      engine: detected.id,
+      phase: 'preparing',
+      doneChunks: 0,
+      totalChunks: 1,
+      chunkPercent: 0,
+      percent: 1,
+      statusText: isAiSeparationEngine(detected.id)
+        ? '🎵 កំពុងបំបែកភ្លេង BGM+SFX ដោយ UVR AI (GPU)...'
+        : '🎵 កំពុងបំបែកភ្លេង BGM...',
+      startedAt: Date.now()
+    });
+
+    const audioInfo = await probeAudioInfo(normalized);
+    if (!audioInfo || !audioInfo.hasAudio) {
+      const err = new Error('វីដេអូនេះគ្មានសំឡេងសម្រាប់បំបែក BGM ទេ។');
+      err.statusCode = 422;
+      throw err;
+    }
+
+    const tmpSuffix = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp.mp3`;
+    const tmpBgmPath = `${bgmPath}.${tmpSuffix}`;
+    const tmpVocalsPath = `${vocalsPath}.${tmpSuffix}`;
+    const tmpMetaPath = `${metaPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+    let usedEngine = 'ffmpeg_dsp';
+    let jobSucceeded = false;
+    let jobCancelled = false;
+
+    try {
+      if (options.engine !== 'ffmpeg_dsp') {
+        const allowAutoEngine = !options.engine || options.engine === 'auto';
+        const preferAudioSep = detected.id === 'audio-separator' && (allowAutoEngine || options.engine === 'audio-separator');
+        const preferDemucs = detected.id === 'demucs' && (allowAutoEngine || options.engine === 'demucs');
+
+        if (preferAudioSep) {
+          try {
+            await runAudioSeparatorSeparation(normalized, tmpBgmPath, tmpVocalsPath, detected, {
+              ...options,
+              resumableKey: key,
+              cleanResume: Boolean(options.force),
+              onProgress: emitProgress,
+              isCancelled: checkCancelledAny,
+              onProcess: registerProc
+            });
+            usedEngine = 'audio-separator';
+          } catch (e) {
+            if (e && e.cancelled) throw e;
+            console.warn('[audio/isolate-bgm] audio-separator fallback to FFmpeg DSP:', e.message);
+            // Remove heavy UVR temp chunks when falling back to FFmpeg DSP so GBs of WAVs don't stay orphaned
+            const failedUvrDir = path.join(getBgmCacheDir(), `_tmp_uvr_job_${key}`);
+            try { if (fs.existsSync(failedUvrDir)) fs.rmSync(failedUvrDir, { recursive: true, force: true }); } catch (_) {}
+          }
+        } else if (preferDemucs) {
+          try {
+            await runDemucsSeparation(normalized, tmpBgmPath, tmpVocalsPath, detected, {
+              isCancelled: checkCancelledAny,
+              onProcess: registerProc
+            });
+            usedEngine = 'demucs';
+          } catch (e) {
+            if (e && e.cancelled) throw e;
+            console.warn('[audio/isolate-bgm] Demucs fallback to FFmpeg DSP:', e.message);
+          }
+        }
+      }
+
+      if (usedEngine === 'ffmpeg_dsp') {
+        if (checkCancelledAny()) throw createBgmCancelledError();
+        emitProgress({
+          phase: 'dsp',
+          doneChunks: 0,
+          totalChunks: 1,
+          chunkPercent: 50,
+          percent: 50,
+          statusText: '🎛️ កំពុងបំបែកភ្លេង BGM ដោយ FFmpeg DSP...'
+        });
+        await Promise.all([
+          runFfmpegExtract(normalized, buildBgmFilterForChannels(audioInfo.channels), tmpBgmPath, '192k', {
+            isCancelled: checkCancelledAny,
+            onProcess: registerProc
+          }),
+          runFfmpegExtract(normalized, buildVocalFilterForChannels(audioInfo.channels), tmpVocalsPath, '160k', {
+            isCancelled: checkCancelledAny,
+            onProcess: registerProc
+          })
+        ]);
+      }
+
+      await Promise.all([
+        renameFileSafe(tmpBgmPath, bgmPath),
+        renameFileSafe(tmpVocalsPath, vocalsPath)
+      ]);
+
+      try {
+        await fs.promises.writeFile(tmpMetaPath, JSON.stringify({
+          engine: usedEngine,
+          videoPath: normalized,
+          createdAt: new Date().toISOString()
+        }, null, 2), 'utf8');
+        await renameFileSafe(tmpMetaPath, metaPath);
+      } catch (_) {}
+      jobSucceeded = true;
+    } catch (jobErr) {
+      if (jobErr && jobErr.cancelled) jobCancelled = true;
+      throw jobErr;
+    } finally {
+      for (const f of [tmpBgmPath, tmpVocalsPath, tmpMetaPath]) {
+        try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
+      }
+      if (activeBgmProgressState.key === key) {
+        updateActiveBgmProgress({
+          running: false,
+          phase: jobSucceeded ? 'done' : (jobCancelled ? 'cancelled' : 'error'),
+          ...(jobSucceeded ? { percent: 100 } : {})
+        });
+      }
+    }
+
+    return {
+      cached: false,
+      key,
+      engine: usedEngine,
+      bgmPath,
+      vocalsPath,
+      bgmUrl: `/bgm_cache/${key}_bgm.mp3`,
+      vocalsUrl: `/bgm_cache/${key}_vocals.mp3`
+    };
+  })().finally(() => {
+    if (inFlightBgmJobs.get(jobKey) === record) {
+      inFlightBgmJobs.delete(jobKey);
+    }
+  });
+
+  record.promise = jobPromise;
+  inFlightBgmJobs.set(jobKey, record);
+  return jobPromise;
 }
 
 function validateVideoPathInput(videoPath) {
@@ -307,6 +1254,9 @@ function validateVideoPathInput(videoPath) {
     return { ok: false, status: 400, error: 'សូមជ្រើសរើសផ្លូវវីដេអូពេញលេញ (Absolute path required)' };
   }
   const normalized = path.normalize(videoPath.trim());
+  if (normalized.startsWith('\\\\') || normalized.startsWith('//') || normalized.slice(2).includes(':')) {
+    return { ok: false, status: 403, error: 'ផ្លូវវីដេអូមិនត្រូវបានអនុញ្ញាតទេ (Forbidden path)' };
+  }
   let stat;
   try {
     stat = fs.statSync(normalized);
@@ -326,9 +1276,21 @@ function validateVideoPathInput(videoPath) {
  * GET /api/audio/capabilities
  */
 router.get('/capabilities', (req, res) => {
+  const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
   res.json({
     success: true,
-    engine: detectSeparationEngine()
+    engine: detectSeparationEngine(refresh)
+  });
+});
+
+/**
+ * GET /api/audio/bgm-progress
+ * Live progress snapshot for active UVR AI / BGM isolation job.
+ */
+router.get('/bgm-progress', (req, res) => {
+  res.json({
+    success: true,
+    ...activeBgmProgressState
   });
 });
 
@@ -386,11 +1348,34 @@ router.post('/isolate-bgm', async (req, res) => {
 router.delete('/cache', (req, res) => {
   try {
     const cacheDir = getBgmCacheDir();
-    const files = fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir) : [];
+    const entries = fs.existsSync(cacheDir) ? fs.readdirSync(cacheDir, { withFileTypes: true }) : [];
     let deletedCount = 0;
-    for (const f of files) {
-      if (f.endsWith('.mp3') || f.endsWith('.json')) {
-        fs.unlinkSync(path.join(cacheDir, f));
+    const now = Date.now();
+    for (const entry of entries) {
+      const f = entry.name;
+      const fullPath = path.join(cacheDir, f);
+      if (f.includes('.tmp.')) {
+        try {
+          const st = fs.statSync(fullPath);
+          if (entry.isFile() && (now - st.mtimeMs) > 60000) {
+            fs.unlinkSync(fullPath);
+            deletedCount++;
+          }
+        } catch (_) {}
+        continue;
+      }
+      if (f.startsWith('_tmp_')) {
+        const isActiveJob = activeBgmProgressState.running && activeBgmProgressState.key && f.includes(activeBgmProgressState.key);
+        if (!isActiveJob && inFlightBgmJobs.size === 0) {
+          try {
+            fs.rmSync(fullPath, { recursive: true, force: true });
+            deletedCount++;
+          } catch (_) {}
+        }
+        continue;
+      }
+      if (entry.isFile() && (f.endsWith('.mp3') || f.endsWith('.json'))) {
+        fs.unlinkSync(fullPath);
         deletedCount++;
       }
     }
@@ -403,13 +1388,38 @@ router.delete('/cache', (req, res) => {
   }
 });
 
+function cancelActiveBgmProcesses() {
+  let killed = 0;
+  for (const rec of inFlightBgmJobs.values()) {
+    if (!rec || !rec.activeProcs) continue;
+    for (const proc of Array.from(rec.activeProcs)) {
+      killed++;
+      try {
+        if (process.platform === 'win32' && proc.pid) {
+          spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        }
+      } catch (_) {}
+      try { proc.kill('SIGKILL'); } catch (_) {}
+    }
+    rec.activeProcs.clear();
+  }
+  return killed;
+}
+
 router.BGM_ISOLATION_FILTER = BGM_ISOLATION_FILTER;
 router.VOCAL_ISOLATION_FILTER = VOCAL_ISOLATION_FILTER;
+router.buildBgmFilterForChannels = buildBgmFilterForChannels;
+router.buildVocalFilterForChannels = buildVocalFilterForChannels;
 router.getBgmCacheDir = getBgmCacheDir;
+router.cancelActiveBgmProcesses = cancelActiveBgmProcesses;
+router.getAiModelsDir = getAiModelsDir;
 router.getBgmCacheKey = getBgmCacheKey;
+router.isAiSeparationEngine = isAiSeparationEngine;
 router.detectSeparationEngine = detectSeparationEngine;
 router.getCachedStemsForVideo = getCachedStemsForVideo;
 router.isolateVideoBgm = isolateVideoBgm;
+router.runAudioSeparatorSeparation = runAudioSeparatorSeparation;
+router.buildChildProcessEnv = buildChildProcessEnv;
 
 module.exports = router;
 

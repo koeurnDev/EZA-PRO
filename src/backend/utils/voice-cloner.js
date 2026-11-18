@@ -205,9 +205,30 @@ function loadClonedVoicesStore() {
 function saveClonedVoicesStore(list) {
   const filePath = getVoicesIndexPath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp`;
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(list, null, 2), 'utf8');
-  fs.renameSync(tmp, filePath);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      fs.renameSync(tmp, filePath);
+      return;
+    } catch (err) {
+      if ((err.code !== 'EPERM' && err.code !== 'EBUSY') || attempt === 4) {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+        throw err;
+      }
+      const sab = new SharedArrayBuffer(4);
+      Atomics.wait(new Int32Array(sab), 0, 0, 30 * (attempt + 1));
+    }
+  }
+}
+
+function resolveSeedVcRunnerPath() {
+  const candidate = path.join(__dirname, 'seed_vc_runner.py');
+  if (candidate.includes('app.asar')) {
+    const unpacked = candidate.replace('app.asar', 'app.asar.unpacked');
+    if (fs.existsSync(unpacked)) return unpacked;
+  }
+  return candidate;
 }
 
 function formatClonedVoiceEntry(item) {
@@ -305,6 +326,9 @@ async function createClonedVoice({
     cleanupTmp = true;
   } else if (typeof sourcePath === 'string' && sourcePath.trim()) {
     const normalized = path.normalize(sourcePath.trim());
+    if (!path.isAbsolute(normalized) || normalized.startsWith('\\\\') || normalized.startsWith('//') || normalized.slice(2).includes(':')) {
+      throw new Error('ផ្លូវឯកសារសំឡេង/វីដេអូមិនត្រូវបានអនុញ្ញាតទេ (Forbidden path)។');
+    }
     if (!fs.existsSync(normalized)) {
       throw new Error('រកមិនឃើញឯកសារសំឡេង/វីដេអូដើមទេ។');
     }
@@ -459,7 +483,7 @@ async function startSeedVcInstall() {
   activeInstallState = {
     state: 'installing',
     percent: 5,
-    stage: 'កំពុងរៀបចំបរិស្ថាន Python នៅ Drive D...',
+    stage: 'កំពុងរៀបចំបរិស្ថាន Python...',
     logs: [`Target engine dir: ${engineDir}`],
     error: '',
     proc: null,
@@ -474,7 +498,7 @@ async function startSeedVcInstall() {
       const venvDir = path.join(engineDir, 'venv');
       const venvPy = getVenvPythonPath(engineDir);
       const repoDir = getSeedVcRepoDir(engineDir);
-      const runnerPy = path.join(__dirname, 'seed_vc_runner.py');
+      const runnerPy = resolveSeedVcRunnerPath();
 
       if (!fs.existsSync(venvPy)) {
         activeInstallState.percent = 12;
@@ -492,9 +516,19 @@ async function startSeedVcInstall() {
       await runLoggedCommand(venvPy, torchArgs, { env });
 
       if (!fs.existsSync(path.join(repoDir, 'inference.py'))) {
+        if (fs.existsSync(repoDir)) {
+          try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch (_) {}
+        }
         activeInstallState.percent = 58;
         activeInstallState.stage = 'កំពុងទាញយក Seed-VC repository...';
-        await runLoggedCommand('git', ['clone', '--depth', '1', 'https://github.com/Plachtaa/seed-vc.git', repoDir], { env });
+        try {
+          await runLoggedCommand('git', ['clone', '--depth', '1', 'https://github.com/Plachtaa/seed-vc.git', repoDir], { env });
+        } catch (cloneErr) {
+          if (!fs.existsSync(path.join(repoDir, 'inference.py'))) {
+            try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch (_) {}
+          }
+          throw cloneErr;
+        }
       }
 
       const reqTxt = path.join(repoDir, 'requirements.txt');
@@ -534,7 +568,13 @@ async function startSeedVcInstall() {
 function cancelSeedVcInstall() {
   activeInstallState.cancelled = true;
   if (activeInstallState.proc) {
-    try { activeInstallState.proc.kill('SIGTERM'); } catch (_) {}
+    try {
+      if (process.platform === 'win32' && activeInstallState.proc.pid) {
+        spawn('taskkill', ['/PID', String(activeInstallState.proc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      } else {
+        activeInstallState.proc.kill('SIGTERM');
+      }
+    } catch (_) {}
   }
   return getCloneEngineStatus();
 }
@@ -580,11 +620,13 @@ async function convertSpeechWithSeedVc({ sourceAudioFile, targetRefWav, outMp3Fi
   const engineDir = getCloneEngineDir();
   const venvPy = getVenvPythonPath(engineDir);
   const repoDir = getSeedVcRepoDir(engineDir);
-  const runnerPy = path.join(__dirname, 'seed_vc_runner.py');
+  const runnerPy = resolveSeedVcRunnerPath();
   const env = getCloneEnvVars(engineDir);
   const hw = detectHardwareInfo(false);
 
-  const rawOutWav = `${outMp3File}.seedvc.wav`;
+  const uniqueTag = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+  const rawOutWav = `${outMp3File}.${uniqueTag}.seedvc.wav`;
+  const tmpOutMp3 = `${outMp3File}.${uniqueTag}.tmp.mp3`;
   try {
     await new Promise((resolve, reject) => {
       const args = [
@@ -598,14 +640,35 @@ async function convertSpeechWithSeedVc({ sourceAudioFile, targetRefWav, outMp3Fi
       ];
       const proc = spawn(venvPy, args, { env, windowsHide: true });
       let stderr = '';
-      proc.stderr.on('data', d => {
-        stderr += d.toString();
-        if (stderr.length > 4000) stderr = stderr.slice(-4000);
-      });
-      proc.on('error', reject);
+      let settled = false;
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve();
+      };
+      const timer = setTimeout(() => {
+        try {
+          if (process.platform === 'win32' && proc.pid) {
+            spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+          } else {
+            proc.kill('SIGKILL');
+          }
+        } catch (_) {}
+        finish(new Error('Seed-VC conversion timed out after 5 minutes'));
+      }, 330000);
+      if (proc.stdout) proc.stdout.resume();
+      if (proc.stderr) {
+        proc.stderr.on('data', d => {
+          stderr += d.toString();
+          if (stderr.length > 4000) stderr = stderr.slice(-4000);
+        });
+      }
+      proc.on('error', finish);
       proc.on('close', code => {
-        if (code === 0 && fs.existsSync(rawOutWav)) return resolve();
-        reject(new Error(`Seed-VC conversion failed (code ${code}): ${stderr.slice(-500)}`));
+        if (code === 0 && fs.existsSync(rawOutWav)) return finish();
+        finish(new Error(`Seed-VC conversion failed (code ${code}): ${stderr.slice(-500)}`));
       });
     });
 
@@ -613,10 +676,22 @@ async function convertSpeechWithSeedVc({ sourceAudioFile, targetRefWav, outMp3Fi
       '-y', '-i', rawOutWav,
       '-ar', '24000', '-ac', '1',
       '-c:a', 'libmp3lame', '-b:a', '64k',
-      outMp3File
+      tmpOutMp3
     ]);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.renameSync(tmpOutMp3, outMp3File);
+        break;
+      } catch (err) {
+        if ((err.code !== 'EPERM' && err.code !== 'EBUSY') || attempt === 4) {
+          throw err;
+        }
+        await new Promise(r => setTimeout(r, 35 * (attempt + 1)));
+      }
+    }
   } finally {
     try { if (fs.existsSync(rawOutWav)) fs.unlinkSync(rawOutWav); } catch (_) {}
+    try { if (fs.existsSync(tmpOutMp3)) fs.unlinkSync(tmpOutMp3); } catch (_) {}
   }
 }
 

@@ -3,6 +3,11 @@ CREATE TABLE IF NOT EXISTS licenses (
   customer_name TEXT NOT NULL DEFAULT '',
   contact TEXT NOT NULL DEFAULT '',
   app_scope TEXT NOT NULL DEFAULT 'all',
+  plan_id TEXT NOT NULL DEFAULT 'monthly_10',
+  price_usd REAL NOT NULL DEFAULT 10,
+  duration_days INTEGER NOT NULL DEFAULT 30,
+  first_activated_at INTEGER,
+  warranty_support TEXT NOT NULL DEFAULT 'standard_warranty',
   status TEXT NOT NULL DEFAULT 'active',
   max_machines INTEGER NOT NULL DEFAULT 1,
   bound_machines TEXT NOT NULL DEFAULT '[]',
@@ -17,6 +22,7 @@ CREATE TABLE IF NOT EXISTS licenses (
 
 CREATE INDEX IF NOT EXISTS idx_licenses_status ON licenses(status);
 CREATE INDEX IF NOT EXISTS idx_licenses_last_seen ON licenses(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_licenses_plan ON licenses(plan_id);
 
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
@@ -35,4 +41,3 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
-

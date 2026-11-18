@@ -22,13 +22,21 @@ function getAccountsFilePath() {
   return process.env.GEMINI_ACCOUNTS_FILE || path.join(__dirname, '..', '..', '..', '.gemini-accounts.json');
 }
 
+let cachedVaultKey = null;
+let cachedVaultKeySecret = '';
+
 function getVaultKey() {
   let user = 'default';
   try {
     user = os.userInfo().username || 'default';
   } catch (_) {}
   const secret = `${os.hostname()}:${user}:eza-pro-gemini-vault-v1`;
-  return crypto.scryptSync(secret, 'eza-pro-salt-v1', 32);
+  if (cachedVaultKey && cachedVaultKeySecret === secret) {
+    return cachedVaultKey;
+  }
+  cachedVaultKeySecret = secret;
+  cachedVaultKey = crypto.scryptSync(secret, 'eza-pro-salt-v1', 32);
+  return cachedVaultKey;
 }
 
 function encryptSecret(plainText) {
@@ -49,14 +57,36 @@ function decryptSecret(payload) {
   return decrypted.toString('utf8');
 }
 
+let cachedAccountsStore = null;
+
+function cloneAccountsStore(store) {
+  return {
+    activeAccountId: store.activeAccountId || null,
+    accounts: (store.accounts || []).map(acc => ({ ...acc }))
+  };
+}
+
 function loadGeminiAccountsStore() {
   const filePath = getAccountsFilePath();
-  if (!fs.existsSync(filePath)) {
+  let stat = null;
+  try {
+    stat = fs.statSync(filePath);
+  } catch (_) {
+    cachedAccountsStore = null;
     return { accounts: [], activeAccountId: null };
+  }
+  if (
+    cachedAccountsStore &&
+    cachedAccountsStore.filePath === filePath &&
+    cachedAccountsStore.mtimeMs === stat.mtimeMs &&
+    cachedAccountsStore.size === stat.size
+  ) {
+    return cloneAccountsStore(cachedAccountsStore.store);
   }
   try {
     const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     if (!raw || !Array.isArray(raw.accounts)) {
+      cachedAccountsStore = null;
       return { accounts: [], activeAccountId: null };
     }
     const accounts = [];
@@ -89,9 +119,32 @@ function loadGeminiAccountsStore() {
     if (!activeAccountId && accounts.length > 0) {
       activeAccountId = accounts[0].id;
     }
-    return { accounts, activeAccountId };
+    const parsedStore = { accounts, activeAccountId };
+    cachedAccountsStore = {
+      filePath,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      store: cloneAccountsStore(parsedStore)
+    };
+    return parsedStore;
   } catch (_) {
+    cachedAccountsStore = null;
     return { accounts: [], activeAccountId: null };
+  }
+}
+
+function renameSyncWithWindowsRetry(srcPath, destPath) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      fs.renameSync(srcPath, destPath);
+      return;
+    } catch (err) {
+      if ((err.code !== 'EPERM' && err.code !== 'EBUSY' && err.code !== 'EACCES') || attempt === 4) {
+        throw err;
+      }
+      const sab = new SharedArrayBuffer(4);
+      Atomics.wait(new Int32Array(sab), 0, 0, 25 * (attempt + 1));
+    }
   }
 }
 
@@ -114,12 +167,18 @@ function saveGeminiAccountsStore(data) {
       lastUsed: acc.lastUsed || null
     }))
   };
-  const tmpPath = `${filePath}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(serialized, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmpPath, filePath);
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(serialized, null, 2), { encoding: 'utf8', mode: 0o600 });
+    renameSyncWithWindowsRetry(tmpPath, filePath);
+  } finally {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+  }
+  cachedAccountsStore = null;
 }
 
 const STREAM_VISUAL_HOLD_MS = 2800;
+const ERROR_PENALTY_TTL_MS = 20000;
 const geminiTelemetryByHash = new Map();
 let usageFlushTimer = null;
 const pendingUsageByHash = new Map();
@@ -134,34 +193,60 @@ function scheduleUsageFlush() {
   usageFlushTimer = setTimeout(() => {
     usageFlushTimer = null;
     if (pendingUsageByHash.size === 0) return;
+    const flushedSnapshot = new Map(pendingUsageByHash);
     try {
       const store = loadGeminiAccountsStore();
       if (!store.accounts.length) {
-        pendingUsageByHash.clear();
+        for (const k of flushedSnapshot.keys()) pendingUsageByHash.delete(k);
         return;
       }
       let dirty = false;
       for (const acc of store.accounts) {
         const keyHash = hashApiKeyForTelemetry(acc.apiKey);
-        const delta = pendingUsageByHash.get(keyHash);
+        const delta = flushedSnapshot.get(keyHash);
         if (delta) {
           acc.requestCount = (Number(acc.requestCount) || 0) + delta;
           acc.lastUsed = new Date().toISOString();
           dirty = true;
         }
       }
-      pendingUsageByHash.clear();
       if (dirty) saveGeminiAccountsStore(store);
-    } catch (_) {
-      pendingUsageByHash.clear();
-    }
+      for (const [k, delta] of flushedSnapshot.entries()) {
+        const current = pendingUsageByHash.get(k) || 0;
+        if (current <= delta) pendingUsageByHash.delete(k);
+        else pendingUsageByHash.set(k, current - delta);
+      }
+    } catch (_) {}
   }, 1500);
   if (typeof usageFlushTimer.unref === 'function') {
     usageFlushTimer.unref();
   }
 }
 
-function beginGeminiStream(apiKey, taskLabel = 'Gemini API') {
+function flushUsageStats() {
+  if (usageFlushTimer) {
+    clearTimeout(usageFlushTimer);
+    usageFlushTimer = null;
+  }
+  if (pendingUsageByHash.size === 0) return;
+  try {
+    const store = loadGeminiAccountsStore();
+    let dirty = false;
+    for (const acc of store.accounts) {
+      const keyHash = hashApiKeyForTelemetry(acc.apiKey);
+      const delta = pendingUsageByHash.get(keyHash);
+      if (delta) {
+        acc.requestCount = (Number(acc.requestCount) || 0) + delta;
+        acc.lastUsed = new Date().toISOString();
+        dirty = true;
+      }
+    }
+    pendingUsageByHash.clear();
+    if (dirty) saveGeminiAccountsStore(store);
+  } catch (_) {}
+}
+
+function beginGeminiStream(apiKey, taskLabel = 'Gemini API', options = {}) {
   const keyHash = hashApiKeyForTelemetry(apiKey);
   if (!keyHash) {
     return { end() {} };
@@ -173,17 +258,19 @@ function beginGeminiStream(apiKey, taskLabel = 'Gemini API') {
     recentUntil: 0,
     lastTask: '',
     lastStatus: 'ready',
-    lastLatencyMs: null
+    lastLatencyMs: null,
+    lastErrorAt: 0
   };
   entry.activeCount += 1;
-  entry.totalRequests += 1;
+  if (!options.skipUsageIncrement) {
+    entry.totalRequests += 1;
+    pendingUsageByHash.set(keyHash, (pendingUsageByHash.get(keyHash) || 0) + 1);
+    scheduleUsageFlush();
+  }
   entry.recentUntil = now + STREAM_VISUAL_HOLD_MS;
   entry.lastTask = String(taskLabel || 'Gemini API');
   entry.lastStatus = 'streaming';
   geminiTelemetryByHash.set(keyHash, entry);
-
-  pendingUsageByHash.set(keyHash, (pendingUsageByHash.get(keyHash) || 0) + 1);
-  scheduleUsageFlush();
 
   let ended = false;
   return {
@@ -199,6 +286,9 @@ function beginGeminiStream(apiKey, taskLabel = 'Gemini API') {
         cur.ewmaLatencyMs = cur.ewmaLatencyMs
           ? Math.round(cur.ewmaLatencyMs * 0.65 + lat * 0.35)
           : lat;
+        cur.lastErrorAt = 0;
+      } else {
+        cur.lastErrorAt = Date.now();
       }
       cur.recentUntil = Date.now() + STREAM_VISUAL_HOLD_MS;
       if (!ok) {
@@ -300,12 +390,19 @@ function getCooldownMapKey(apiKey, scope = 'general') {
 function isGeminiKeyRateLimited(apiKey, scope = 'general') {
   const k = getCooldownMapKey(apiKey, scope);
   if (!k) return false;
+  const now = Date.now();
   const until = geminiKeyCooldownByScope.get(k) || 0;
-  if (until <= Date.now()) {
-    if (until > 0) geminiKeyCooldownByScope.delete(k);
-    return false;
+  if (until > now) return true;
+  if (until > 0) geminiKeyCooldownByScope.delete(k);
+
+  // If checking a specific scope, also respect active global/general cooldowns
+  if (scope && scope !== 'general') {
+    const genKey = getCooldownMapKey(apiKey, 'general');
+    const genUntil = geminiKeyCooldownByScope.get(genKey) || 0;
+    if (genUntil > now) return true;
+    if (genUntil > 0) geminiKeyCooldownByScope.delete(genKey);
   }
-  return true;
+  return false;
 }
 
 function markGeminiKeyRateLimited(apiKey, durationMs = 60000, scope = 'general') {
@@ -323,6 +420,12 @@ function markGeminiKeyRateLimited(apiKey, durationMs = 60000, scope = 'general')
 function markGeminiKeyHealthy(apiKey, scope = 'general') {
   const k = getCooldownMapKey(apiKey, scope);
   if (k) geminiKeyCooldownByScope.delete(k);
+  const keyHash = hashApiKeyForTelemetry(apiKey);
+  const tel = keyHash ? geminiTelemetryByHash.get(keyHash) : null;
+  if (tel && (tel.lastStatus === 'rate_limited' || tel.lastStatus === 'error')) {
+    tel.lastStatus = tel.activeCount > 0 ? 'streaming' : 'ready';
+    tel.lastErrorAt = 0;
+  }
 }
 
 /**
@@ -353,20 +456,32 @@ function getGeminiApiKeyCandidates(primaryKey = '', scope = 'general', options =
   for (const acc of data.accounts) {
     if (acc.enabled !== false) pushUnique(acc.apiKey);
   }
-  if (process.env.GEMINI_API_KEY) {
+  if (process.env.GEMINI_API_KEY && process.env.EZA_PACKAGED !== '1') {
     pushUnique(process.env.GEMINI_API_KEY);
   }
 
   const healthy = ordered.filter(k => !isGeminiKeyRateLimited(k, scope));
   if (healthy.length === 0) {
-    return options.skipAllRateLimited ? [] : ordered;
+    if (options.skipAllRateLimited) return [];
+    // Sort cooled-down keys by soonest-expiring cooldown so retries pick the earliest key to recover
+    return ordered
+      .map((key, idx) => ({
+        key,
+        idx,
+        until: geminiKeyCooldownByScope.get(getCooldownMapKey(key, scope)) || 0
+      }))
+      .sort((a, b) => (a.until - b.until) || (a.idx - b.idx))
+      .map(item => item.key);
   }
   if (healthy.length === 1 || options.preferPrimary) return healthy;
 
   // Smart load-balancing: rotate starting position and prefer idle + lower-latency accounts first
   const offset = smartRouterCursor % healthy.length;
-  smartRouterCursor = (smartRouterCursor + 1) % 1000000;
+  if (options.advanceCursor !== false) {
+    smartRouterCursor = (smartRouterCursor + 1) % 1000000;
+  }
   const rotated = healthy.slice(offset).concat(healthy.slice(0, offset));
+  const now = Date.now();
 
   return rotated
     .map((key, idx) => {
@@ -374,7 +489,7 @@ function getGeminiApiKeyCandidates(primaryKey = '', scope = 'general', options =
       const activeCount = tel ? (tel.activeCount || 0) : 0;
       const ewma = tel && tel.ewmaLatencyMs ? tel.ewmaLatencyMs : 0;
       const slowPenalty = ewma > 9000 ? 1 : 0;
-      const recentErrPenalty = tel && tel.lastStatus === 'error' ? 1 : 0;
+      const recentErrPenalty = (tel && tel.lastStatus === 'error' && (now - (tel.lastErrorAt || 0)) < ERROR_PENALTY_TTL_MS) ? 1 : 0;
       return { key, idx, activeCount, slowPenalty, recentErrPenalty };
     })
     .sort((a, b) =>
@@ -454,11 +569,20 @@ function deleteGeminiAccountRecord(accountId) {
   if (idx === -1) {
     throw new Error('រកមិនឃើញ Gemini account នេះទេ។');
   }
-  data.accounts.splice(idx, 1);
+  const [removed] = data.accounts.splice(idx, 1);
   if (data.activeAccountId === accountId.trim()) {
     data.activeAccountId = data.accounts.length > 0 ? data.accounts[0].id : null;
   }
   saveGeminiAccountsStore(data);
+  const removedHash = removed ? hashApiKeyForTelemetry(removed.apiKey) : '';
+  if (removedHash && !data.accounts.some(acc => hashApiKeyForTelemetry(acc.apiKey) === removedHash)) {
+    geminiTelemetryByHash.delete(removedHash);
+    pendingUsageByHash.delete(removedHash);
+    const suffix = `::${removedHash}`;
+    for (const mapKey of Array.from(geminiKeyCooldownByScope.keys())) {
+      if (mapKey.endsWith(suffix)) geminiKeyCooldownByScope.delete(mapKey);
+    }
+  }
   return getSafeGeminiAccounts(data);
 }
 
@@ -513,6 +637,9 @@ function updateGeminiAccountRecord(accountId, input = {}) {
   if (apiKey && (apiKey.length < 20 || apiKey.length > 512)) {
     throw new Error('Gemini API Key មិនត្រឹមត្រូវទេ។');
   }
+  if (apiKey && data.accounts.some(item => item.id !== account.id && item.apiKey === apiKey)) {
+    throw new Error('Gemini API Key នេះមានរួចហើយនៅក្នុង Router Account ផ្សេង។');
+  }
   account.name = name;
   account.email = email;
   if (typeof input.enabled === 'boolean') {
@@ -547,7 +674,10 @@ function parseGeminiBatchKeysInput(rawText, existingCount = 0) {
 
     if (trimmed.includes('|')) {
       const parts = trimmed.split('|').map(s => s.trim()).filter(Boolean);
-      const keyIdx = parts.findIndex(p => /^(AIza|AQ\.)/i.test(p) || p.length >= 20);
+      let keyIdx = parts.findIndex(p => /^(AIza|AQ\.)/i.test(p));
+      if (keyIdx === -1) {
+        keyIdx = parts.findIndex(p => p.length >= 20 && !/@/.test(p) && !/\s/.test(p));
+      }
       if (keyIdx !== -1) {
         apiKey = parts[keyIdx];
         const meta = parts.filter((_, idx) => idx !== keyIdx);
@@ -631,15 +761,21 @@ function batchAddGeminiAccountsRecord(input = {}) {
   };
 }
 
-function syncAccountsFromDesktop(desktopData) {
-  if (!desktopData || !Array.isArray(desktopData.accounts) || desktopData.accounts.length === 0) return;
+function syncAccountsFromDesktop(desktopData, options = {}) {
+  if (!desktopData || !Array.isArray(desktopData.accounts)) return;
+  const authoritative = Boolean(options && options.authoritative);
+  if (!authoritative && desktopData.accounts.length === 0) return;
   try {
     const store = loadGeminiAccountsStore();
     const byId = new Map(store.accounts.map(a => [a.id, a]));
     const byKey = new Map(store.accounts.map(a => [a.apiKey, a]));
+    const incomingIds = new Set();
+    const incomingKeys = new Set();
     for (const acc of desktopData.accounts) {
       if (!acc || typeof acc.apiKey !== 'string' || !acc.apiKey.trim()) continue;
       const key = acc.apiKey.trim();
+      incomingKeys.add(key);
+      if (acc.id) incomingIds.add(acc.id);
       const existing = (acc.id && byId.get(acc.id)) || byKey.get(key);
       if (existing) {
         if (acc.name) existing.name = acc.name;
@@ -661,12 +797,17 @@ function syncAccountsFromDesktop(desktopData) {
         byKey.set(key, entry);
       }
     }
+    if (authoritative) {
+      store.accounts = store.accounts.filter(acc => incomingIds.has(acc.id) || incomingKeys.has(acc.apiKey));
+    }
     if (desktopData.activeAccountId) {
       const matched = store.accounts.find(a => a.id === desktopData.activeAccountId);
       if (matched) store.activeAccountId = matched.id;
     }
-    if (!store.activeAccountId && store.accounts.length > 0) {
+    if ((!store.activeAccountId || !store.accounts.some(a => a.id === store.activeAccountId)) && store.accounts.length > 0) {
       store.activeAccountId = store.accounts[0].id;
+    } else if (store.accounts.length === 0) {
+      store.activeAccountId = null;
     }
     saveGeminiAccountsStore(store);
   } catch (_) {}
@@ -675,10 +816,59 @@ function syncAccountsFromDesktop(desktopData) {
 /**
  * Load configuration from disk
  */
+const DEFAULT_RESPAN_BASE_URL = 'https://gateway.respan.ai/v1';
+const DEFAULT_RESPAN_MODEL = 'openai/gpt-6.2-sol:free';
+
+function normalizeRespanBaseUrl(rawUrl = '') {
+  const cleaned = String(rawUrl || '').trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+  if (!cleaned) return DEFAULT_RESPAN_BASE_URL;
+  try {
+    const parsed = new URL(cleaned);
+    const host = String(parsed.hostname || '').toLowerCase();
+    const isLocalHost = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && isLocalHost)) {
+      return DEFAULT_RESPAN_BASE_URL;
+    }
+    return parsed.toString().replace(/\/+$/, '');
+  } catch (_) {
+    return DEFAULT_RESPAN_BASE_URL;
+  }
+}
+
+function normalizeRespanModel(rawModel = '') {
+  const cleaned = String(rawModel || '').trim();
+  if (!cleaned || cleaned.length > 160 || /\s/.test(cleaned)) {
+    return DEFAULT_RESPAN_MODEL;
+  }
+  return cleaned;
+}
+
+function normalizeRespanRole(rawRole = '') {
+  const val = String(rawRole || '').trim().toLowerCase();
+  if (val === 'primary' || val === 'off' || val === 'assist') return val;
+  return 'assist';
+}
+
+function parseDotEnvVar(envData, varName) {
+  if (!envData || !varName) return '';
+  const re = new RegExp(`^\\s*(?:export\\s+)?${varName}\\s*=\\s*(.*?)\\s*$`, 'm');
+  const match = envData.match(re);
+  if (!match) return '';
+  return match[1].replace(/^(['"])(.*)\1$/, '$2').trim();
+}
+
+/**
+ * Load configuration from config.json + optional secure storage & .env fallbacks
+ */
 function loadConfig(req = null) {
+  const isStrictPackaged = process.env.EZA_PACKAGED === '1';
   let cfg = {
     GEMINI_API_KEY: '',
-    DOWNLOAD_DIR: 'D:\\HDRG'
+    RESPAN_API_KEY: '',
+    RESPAN_BASE_URL: DEFAULT_RESPAN_BASE_URL,
+    RESPAN_MODEL: DEFAULT_RESPAN_MODEL,
+    RESPAN_ROLE: 'assist',
+    DOWNLOAD_DIR: ''
   };
 
   // Try loading from config.json
@@ -687,6 +877,17 @@ function loadConfig(req = null) {
     try {
       const data = JSON.parse(fs.readFileSync(configFile, 'utf8'));
       cfg = { ...cfg, ...data };
+      if (typeof data.RESPAN_API_KEY_ENC === 'string' && data.RESPAN_API_KEY_ENC.trim()) {
+        try {
+          cfg.RESPAN_API_KEY = decryptSecret(data.RESPAN_API_KEY_ENC.trim());
+        } catch (_) {}
+      }
+      if (isStrictPackaged) {
+        cfg.GEMINI_API_KEY = '';
+        if (!data.RESPAN_API_KEY_ENC) {
+          cfg.RESPAN_API_KEY = '';
+        }
+      }
     } catch (_) {}
   }
 
@@ -710,27 +911,53 @@ function loadConfig(req = null) {
     }
   }
 
-  // Fallback to process.env
-  if (!cfg.GEMINI_API_KEY && process.env.GEMINI_API_KEY) {
+  // In development/test only: optional fallback to process.env or .env (never in packaged .exe)
+  if (!isStrictPackaged && !cfg.GEMINI_API_KEY && process.env.GEMINI_API_KEY) {
     cfg.GEMINI_API_KEY = process.env.GEMINI_API_KEY;
   }
+  if (!isStrictPackaged) {
+    if (!cfg.RESPAN_API_KEY && process.env.RESPAN_API_KEY) {
+      cfg.RESPAN_API_KEY = String(process.env.RESPAN_API_KEY).trim();
+    }
+    if (process.env.RESPAN_BASE_URL) cfg.RESPAN_BASE_URL = process.env.RESPAN_BASE_URL;
+    if (process.env.RESPAN_MODEL) cfg.RESPAN_MODEL = process.env.RESPAN_MODEL;
+    if (process.env.RESPAN_ROLE) cfg.RESPAN_ROLE = process.env.RESPAN_ROLE;
 
-  // Try loading from .env file (ignoring commented lines)
-  if (!cfg.GEMINI_API_KEY) {
     const envFile = path.join(__dirname, '..', '..', '..', '.env');
     if (fs.existsSync(envFile)) {
       try {
         const envData = fs.readFileSync(envFile, 'utf8');
-        const match = envData.match(/^\s*(?:export\s+)?GEMINI_API_KEY\s*=\s*(.*?)\s*$/m);
-        if (match) {
-          const parsedKey = match[1].replace(/^(['"])(.*)\1$/, '$2').trim();
-          if (parsedKey) {
-            cfg.GEMINI_API_KEY = parsedKey;
+        if (!cfg.GEMINI_API_KEY) {
+          const parsedGemini = parseDotEnvVar(envData, 'GEMINI_API_KEY');
+          if (parsedGemini) cfg.GEMINI_API_KEY = parsedGemini;
+        }
+        if (!cfg.RESPAN_API_KEY) {
+          const parsedRespan = parseDotEnvVar(envData, 'RESPAN_API_KEY');
+          if (parsedRespan) cfg.RESPAN_API_KEY = parsedRespan;
+        }
+        const envBaseUrl = parseDotEnvVar(envData, 'RESPAN_BASE_URL');
+        const envModel = parseDotEnvVar(envData, 'RESPAN_MODEL');
+        const envRole = parseDotEnvVar(envData, 'RESPAN_ROLE');
+        if (envBaseUrl && cfg.RESPAN_BASE_URL === DEFAULT_RESPAN_BASE_URL) cfg.RESPAN_BASE_URL = envBaseUrl;
+        if (envModel && cfg.RESPAN_MODEL === DEFAULT_RESPAN_MODEL) cfg.RESPAN_MODEL = envModel;
+        if (envRole) cfg.RESPAN_ROLE = envRole;
+
+        // Also support generic API="..." line in .env cleanly (routes AIza/AQ keys to Gemini, others to Respan)
+        const parsedGenericApi = parseDotEnvVar(envData, 'API');
+        if (parsedGenericApi) {
+          if (/^(AIza|AQ\.)/i.test(parsedGenericApi)) {
+            if (!cfg.GEMINI_API_KEY) cfg.GEMINI_API_KEY = parsedGenericApi;
+          } else if (!cfg.RESPAN_API_KEY) {
+            cfg.RESPAN_API_KEY = parsedGenericApi;
           }
         }
       } catch (_) {}
     }
   }
+
+  cfg.RESPAN_BASE_URL = normalizeRespanBaseUrl(cfg.RESPAN_BASE_URL);
+  cfg.RESPAN_MODEL = normalizeRespanModel(cfg.RESPAN_MODEL);
+  cfg.RESPAN_ROLE = normalizeRespanRole(cfg.RESPAN_ROLE);
 
   return cfg;
 }
@@ -741,19 +968,272 @@ function loadConfig(req = null) {
 function saveConfig(cfg) {
   try {
     const configFile = getConfigFilePath();
-    const existing = fs.existsSync(configFile) 
-      ? JSON.parse(fs.readFileSync(configFile, 'utf8'))
-      : {};
-    
+    const dir = path.dirname(configFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    let existing = {};
+    if (fs.existsSync(configFile)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          existing = parsed;
+        }
+      } catch (_) {}
+    }
+
     const merged = { ...existing, ...cfg };
-    fs.writeFileSync(configFile, JSON.stringify(merged, null, 2), 'utf8');
-    
+    const tmpPath = `${configFile}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, JSON.stringify(merged, null, 2), 'utf8');
+      renameSyncWithWindowsRetry(tmpPath, configFile);
+    } finally {
+      try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+    }
+
     return true;
   } catch (err) {
     console.error('Failed to save config:', err);
     throw err;
   }
 }
+
+const RESTRICTED_PUBLIC_CONFIG_KEYS = new Set([
+  'GEMINI_API_KEY',
+  'GEMINI_ACCOUNTS',
+  'RESPAN_API_KEY',
+  'RESPAN_API_KEY_ENC',
+  'GEMINI_VAULT_KEY',
+  'EZA_VAULT_KEY',
+  'CLOUD_LICENSE_KEY',
+  'LICENSE_PRIVATE_KEY',
+  'LICENSE_SECRET',
+  'ADMIN_TOKEN',
+  'USER_ACCESS_ENABLED',
+  'USER_ACCESS_CODE',
+  'MAINTENANCE_BANNER',
+  'MAINTENANCE_LOCKED',
+  'ROUTER_DEFAULT_LOCKED',
+  '__proto__',
+  'constructor',
+  'prototype'
+]);
+
+const respanTelemetry = {
+  activeCount: 0,
+  totalRequests: 0,
+  recentUntil: 0,
+  lastStatus: 'ready',
+  lastLatencyMs: null,
+  cooldownUntil: 0,
+  lastError: ''
+};
+
+function beginRespanStream() {
+  const startedAt = Date.now();
+  respanTelemetry.activeCount += 1;
+  respanTelemetry.totalRequests += 1;
+  respanTelemetry.recentUntil = startedAt + STREAM_VISUAL_HOLD_MS;
+  respanTelemetry.lastStatus = 'streaming';
+  let ended = false;
+  return {
+    end(ok = true, statusCode = 200, errorMsg = '') {
+      if (ended) return;
+      ended = true;
+      respanTelemetry.activeCount = Math.max(0, respanTelemetry.activeCount - 1);
+      respanTelemetry.lastLatencyMs = Math.max(1, Date.now() - startedAt);
+      respanTelemetry.recentUntil = Date.now() + STREAM_VISUAL_HOLD_MS;
+      if (ok) {
+        respanTelemetry.lastStatus = respanTelemetry.activeCount > 0 ? 'streaming' : 'ready';
+        respanTelemetry.lastError = '';
+      } else {
+        respanTelemetry.lastStatus = statusCode === 429 ? 'rate_limited' : 'error';
+        respanTelemetry.lastError = String(errorMsg || '');
+      }
+    }
+  };
+}
+
+function markRespanRateLimited(durationMs = 20000) {
+  const ms = Math.max(5000, Number(durationMs) || 20000);
+  respanTelemetry.cooldownUntil = Math.max(respanTelemetry.cooldownUntil || 0, Date.now() + ms);
+  respanTelemetry.lastStatus = 'rate_limited';
+}
+
+function markRespanHealthy() {
+  respanTelemetry.cooldownUntil = 0;
+  respanTelemetry.lastError = '';
+  if (respanTelemetry.activeCount === 0) respanTelemetry.lastStatus = 'ready';
+}
+
+function isRespanRateLimited() {
+  return (respanTelemetry.cooldownUntil || 0) > Date.now();
+}
+
+function getRespanRuntimeConfig(req = null) {
+  const cfg = loadConfig(req);
+  const apiKey = typeof cfg.RESPAN_API_KEY === 'string' ? cfg.RESPAN_API_KEY.trim() : '';
+  const role = normalizeRespanRole(cfg.RESPAN_ROLE);
+  return {
+    apiKey,
+    baseUrl: normalizeRespanBaseUrl(cfg.RESPAN_BASE_URL),
+    model: normalizeRespanModel(cfg.RESPAN_MODEL),
+    role,
+    enabled: Boolean(apiKey && role !== 'off')
+  };
+}
+
+function getSafeRespanSnapshot(req = null) {
+  const rt = getRespanRuntimeConfig(req);
+  const now = Date.now();
+  const cooldownRemainingMs = Math.max(0, (respanTelemetry.cooldownUntil || 0) - now);
+  const isStreaming = respanTelemetry.activeCount > 0 || respanTelemetry.recentUntil > now;
+  const k = rt.apiKey;
+  return {
+    hasKey: Boolean(k),
+    enabled: rt.enabled,
+    role: rt.role,
+    baseUrl: rt.baseUrl,
+    model: rt.model,
+    keyHint: k.length >= 12 ? `${k.slice(0, 6)}...${k.slice(-4)}` : (k ? '••••••••' : ''),
+    activeCount: respanTelemetry.activeCount,
+    totalRequests: respanTelemetry.totalRequests,
+    isStreaming,
+    lastStatus: respanTelemetry.activeCount > 0
+      ? 'streaming'
+      : (cooldownRemainingMs > 0 ? 'rate_limited' : respanTelemetry.lastStatus),
+    lastLatencyMs: respanTelemetry.lastLatencyMs,
+    cooldownRemainingMs,
+    lastError: respanTelemetry.lastError || ''
+  };
+}
+
+function saveRespanConfigRecord(input = {}) {
+  const nextPatch = {};
+  if (input && input.clearKey === true) {
+    nextPatch.RESPAN_API_KEY = '';
+    nextPatch.RESPAN_API_KEY_ENC = '';
+  } else if (input && typeof input.apiKey === 'string' && input.apiKey.trim()) {
+    const cleanKey = input.apiKey.trim();
+    if (cleanKey.length < 12 || cleanKey.length > 512 || /\s/.test(cleanKey)) {
+      throw new Error('Respan API Key មិនត្រឹមត្រូវទេ (ត្រូវមានយ៉ាងតិច 12 តួអក្សរ និងគ្មានដកឃ្លា)។');
+    }
+    nextPatch.RESPAN_API_KEY = '';
+    nextPatch.RESPAN_API_KEY_ENC = encryptSecret(cleanKey);
+  }
+  if (input && typeof input.baseUrl === 'string' && input.baseUrl.trim()) {
+    nextPatch.RESPAN_BASE_URL = normalizeRespanBaseUrl(input.baseUrl);
+  }
+  if (input && typeof input.model === 'string' && input.model.trim()) {
+    nextPatch.RESPAN_MODEL = normalizeRespanModel(input.model);
+  }
+  if (input && typeof input.role === 'string' && input.role.trim()) {
+    nextPatch.RESPAN_ROLE = normalizeRespanRole(input.role);
+  }
+  saveConfig(nextPatch);
+  markRespanHealthy();
+  return getSafeRespanSnapshot();
+}
+
+function probeRespanConnection({ apiKey = '', baseUrl = '', model = '' } = {}) {
+  const httpMod = require('http');
+  const rt = getRespanRuntimeConfig();
+  const keyToUse = String(apiKey || '').trim() || rt.apiKey;
+  const resolvedBase = normalizeRespanBaseUrl(baseUrl || rt.baseUrl);
+  const resolvedModel = normalizeRespanModel(model || rt.model);
+  if (!keyToUse) {
+    return Promise.resolve({
+      healthy: false,
+      statusCode: 401,
+      latencyMs: 0,
+      error: 'មិនទាន់មាន Respan API Key ទេ'
+    });
+  }
+
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const stream = beginRespanStream();
+    let settled = false;
+    const finish = (ok, statusCode, errorMsg = '', modelReply = '') => {
+      if (settled) return;
+      settled = true;
+      stream.end(ok, statusCode, errorMsg);
+      if (ok) markRespanHealthy();
+      resolve({
+        healthy: ok,
+        statusCode,
+        latencyMs: Date.now() - started,
+        error: errorMsg,
+        modelReply
+      });
+    };
+
+    let targetUrl;
+    try {
+      targetUrl = new URL(`${resolvedBase}/chat/completions`);
+    } catch (e) {
+      return finish(false, 400, e.message);
+    }
+
+    const payload = JSON.stringify({
+      model: resolvedModel,
+      messages: [
+        { role: 'system', content: 'Reply cleanly in JSON only.' },
+        { role: 'user', content: 'Translate "你好" to everyday Khmer. Output JSON: {"ok":true,"km":"សួស្តី"}' }
+      ],
+      max_tokens: 48,
+      temperature: 0.1
+    });
+
+    const mod = targetUrl.protocol === 'http:' ? httpMod : https;
+    const req = mod.request({
+      hostname: targetUrl.hostname,
+      port: targetUrl.port || (targetUrl.protocol === 'http:' ? 80 : 443),
+      path: `${targetUrl.pathname}${targetUrl.search}`,
+      method: 'POST',
+      family: 4,
+      timeout: 12000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${keyToUse}`,
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { body += chunk; });
+      res.on('error', err => finish(false, res.statusCode || 502, err ? err.message : 'Response error'));
+      res.on('end', () => {
+        if (settled) return;
+        let parsed = null;
+        try { parsed = JSON.parse(body); } catch (_) {}
+        if (res.statusCode >= 200 && res.statusCode < 300 && parsed && Array.isArray(parsed.choices) && parsed.choices.length > 0) {
+          const reply = String((parsed.choices[0].message && parsed.choices[0].message.content) || '').trim();
+          return finish(true, res.statusCode, '', reply.slice(0, 120));
+        }
+        const errMsg = (parsed && parsed.error && parsed.error.message) || `HTTP ${res.statusCode}`;
+        finish(false, res.statusCode, errMsg);
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('Request timed out')));
+    req.on('error', err => finish(false, 502, err ? err.message : 'Request failed'));
+    req.end(payload);
+  });
+}
+
+router.use((req, res, next) => {
+  if (req.path === '/verify-access' || (req.path === '/system-hub' && req.method === 'GET')) {
+    return next();
+  }
+  if (!isCallerAuthorized(req)) {
+    return res.status(401).json({
+      success: false,
+      authRequired: true,
+      error: 'សូមបញ្ចូលលេខកូដសុវត្ថិភាពជាមុនសិន។'
+    });
+  }
+  next();
+});
 
 /**
  * GET /api/config
@@ -762,11 +1242,16 @@ function saveConfig(cfg) {
 router.get('/', (req, res) => {
   try {
     const cfg = loadConfig(req);
+    const hasRespanKey = Boolean(cfg.RESPAN_API_KEY);
     res.json({ 
       success: true, 
       config: {
         DOWNLOAD_DIR: cfg.DOWNLOAD_DIR,
-        hasApiKey: !!cfg.GEMINI_API_KEY
+        hasApiKey: !!(cfg.GEMINI_API_KEY || (hasRespanKey && cfg.RESPAN_ROLE !== 'off')),
+        hasGeminiKey: !!cfg.GEMINI_API_KEY,
+        hasRespanKey,
+        respanRole: cfg.RESPAN_ROLE,
+        respanModel: cfg.RESPAN_MODEL
       }
     });
   } catch (err) {
@@ -792,7 +1277,17 @@ router.post('/', (req, res) => {
         error: 'API keys must be saved through the secure desktop settings.'
       });
     }
-    saveConfig(req.body);
+    const sanitized = {};
+    for (const [k, v] of Object.entries(req.body)) {
+      if (RESTRICTED_PUBLIC_CONFIG_KEYS.has(k)) {
+        return res.status(403).json({
+          success: false,
+          error: `Restricted configuration key "${k}" cannot be modified via public /api/config.`
+        });
+      }
+      sanitized[k] = v;
+    }
+    saveConfig(sanitized);
     res.json({ success: true, message: 'Configuration saved' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -806,7 +1301,38 @@ router.post('/', (req, res) => {
 router.get('/accounts', (req, res) => {
   try {
     const result = getSafeGeminiAccounts();
-    return res.json({ success: true, ...result });
+    return res.json({ success: true, ...result, respan: getSafeRespanSnapshot(req) });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/respan', (req, res) => {
+  try {
+    return res.json({ success: true, ...getSafeRespanSnapshot(req) });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.post('/respan', (req, res) => {
+  try {
+    const snap = saveRespanConfigRecord(req.body || {});
+    return res.json({ success: true, ...snap });
+  } catch (err) {
+    return res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.post('/respan/test', async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const probe = await probeRespanConnection({
+      apiKey: body.apiKey,
+      baseUrl: body.baseUrl,
+      model: body.model
+    });
+    return res.json({ success: true, ...probe, respan: getSafeRespanSnapshot(req) });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -884,7 +1410,20 @@ router.delete('/accounts/:id', (req, res) => {
 function probeGeminiKey(apiKey) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const stream = beginGeminiStream(apiKey, 'Connection Test');
+    const stream = beginGeminiStream(apiKey, 'Connection Test', { skipUsageIncrement: true });
+    let settled = false;
+    const finish = (ok, statusCode, errorMsg) => {
+      if (settled) return;
+      settled = true;
+      stream.end(ok, statusCode);
+      resolve({
+        healthy: ok,
+        statusCode,
+        latencyMs: Date.now() - started,
+        error: errorMsg
+      });
+    };
+
     const req = https.request({
       hostname: 'generativelanguage.googleapis.com',
       path: `/v1beta/models?pageSize=1&key=${encodeURIComponent(apiKey)}`,
@@ -892,33 +1431,36 @@ function probeGeminiKey(apiKey) {
       family: 4,
       timeout: 6500
     }, (res) => {
-      let body = '';
-      res.on('data', chunk => { body += chunk; });
+      res.on('data', () => {});
+      res.on('error', (err) => {
+        finish(false, res.statusCode || 502, err ? err.message : 'Response stream error');
+      });
       res.on('end', () => {
         const ok = res.statusCode >= 200 && res.statusCode < 300;
-        stream.end(ok, res.statusCode);
-        resolve({
-          healthy: ok,
-          statusCode: res.statusCode,
-          latencyMs: Date.now() - started,
-          error: ok ? '' : `HTTP ${res.statusCode}`
-        });
+        finish(ok, res.statusCode, ok ? '' : `HTTP ${res.statusCode}`);
       });
     });
     req.on('timeout', () => {
       req.destroy(new Error('Request timed out'));
     });
     req.on('error', (err) => {
-      stream.end(false, 502);
-      resolve({
-        healthy: false,
-        statusCode: 0,
-        latencyMs: Date.now() - started,
-        error: err.message
-      });
+      finish(false, 502, err ? err.message : 'Request failed');
     });
     req.end();
   });
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  const limit = Math.max(1, Math.min(Number(concurrency) || 1, items.length || 1));
+  let cursor = 0;
+  await Promise.all(Array.from({ length: limit }, async () => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      results[idx] = await worker(items[idx], idx);
+    }
+  }));
+  return results;
 }
 
 router.post('/accounts/test', async (req, res) => {
@@ -946,20 +1488,20 @@ router.post('/accounts/test', async (req, res) => {
 
 /**
  * POST /api/config/accounts/test-all
- * Probe every saved Gemini account concurrently without exposing API keys
+ * Probe every saved Gemini account with bounded concurrency without exposing API keys
  */
 router.post('/accounts/test-all', async (req, res) => {
   try {
     const store = loadGeminiAccountsStore();
     const enabledAccounts = store.accounts.filter(acc => acc.enabled !== false);
-    const results = await Promise.all(enabledAccounts.map(async (acc) => {
+    const results = await mapWithConcurrency(enabledAccounts, 5, async (acc) => {
       const probe = await probeGeminiKey(acc.apiKey);
       return {
         accountId: acc.id,
         name: acc.name,
         ...probe
       };
-    }));
+    });
     const healthyCount = results.filter(r => r.healthy).length;
     const pausedCount = store.accounts.length - enabledAccounts.length;
     const snapshot = getSafeGeminiAccounts(loadGeminiAccountsStore());
@@ -1041,13 +1583,37 @@ function detectLanAddresses(port = 3001) {
 const LICENSE_MASTER_SECRET = process.env.EZA_LICENSE_SECRET || 'eza-pro-master-license-hmac-secret-2026-v1';
 const accessFailedAttempts = new Map();
 
-function getMachineHardwareId() {
+let cachedMachineHardwareId = '';
+
+function readWindowsMachineGuid() {
+  if (process.platform !== 'win32') return '';
   try {
+    const { spawnSync } = require('child_process');
+    const res = spawnSync(
+      'reg.exe',
+      ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'],
+      { encoding: 'utf8', windowsHide: true, timeout: 2000 }
+    );
+    if (res.status === 0 && res.stdout) {
+      const match = res.stdout.match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{16,64})/);
+      if (match && match[1]) return match[1].trim().toLowerCase();
+    }
+  } catch (_) {}
+  return '';
+}
+
+function getMachineHardwareId() {
+  if (cachedMachineHardwareId) return cachedMachineHardwareId;
+  try {
+    const winGuid = readWindowsMachineGuid();
     const cpus = os.cpus() || [];
     const cpuModel = cpus[0] ? cpus[0].model : 'generic-cpu';
-    const raw = `${os.platform()}|${os.arch()}|${os.hostname()}|${cpuModel}|${cpus.length}`;
+    const raw = winGuid
+      ? `win32-guid|${os.arch()}|${winGuid}`
+      : `${os.platform()}|${os.arch()}|${os.hostname()}|${cpuModel}|${cpus.length}`;
     const digest = crypto.createHash('sha256').update(raw).digest('hex').toUpperCase();
-    return `EZA-${digest.slice(0, 4)}-${digest.slice(4, 8)}-${digest.slice(8, 12)}`;
+    cachedMachineHardwareId = `EZA-${digest.slice(0, 4)}-${digest.slice(4, 8)}-${digest.slice(8, 12)}`;
+    return cachedMachineHardwareId;
   } catch (_) {
     return 'EZA-0000-0000-0000';
   }
@@ -1121,9 +1687,52 @@ function verifyHashedPasscode(plainCode, storedValue) {
   return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
 }
 
-function issueSignedAccessToken(subject = 'user') {
+const ACCESS_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+function getPasscodeVersionTag(storedPasscode) {
+  const clean = String(storedPasscode || '').trim();
+  if (!clean) return '';
+  return crypto.createHash('sha256').update(clean).digest('hex').slice(0, 8);
+}
+
+function isLoopbackAddress(rawIp) {
+  const ip = String(rawIp || '').trim();
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
+function isLoopbackNonForwardedRequest(req) {
+  if (!req) return true;
+  const headers = req.headers || {};
+  if (
+    headers['cf-connecting-ip'] ||
+    headers['x-forwarded-for'] ||
+    headers['x-real-ip'] ||
+    headers.forwarded
+  ) {
+    return false;
+  }
+  return isLoopbackAddress((req.socket && req.socket.remoteAddress) || req.ip);
+}
+
+function getRateLimitClientKey(req) {
+  const sockIp = String((req && req.socket && req.socket.remoteAddress) || (req && req.ip) || 'local').trim();
+  const headers = (req && req.headers) || {};
+  if (isLoopbackAddress(sockIp)) {
+    const cfIp = typeof headers['cf-connecting-ip'] === 'string' ? headers['cf-connecting-ip'].trim() : '';
+    if (cfIp) return `cf:${cfIp}`;
+    const xff = typeof headers['x-forwarded-for'] === 'string' ? headers['x-forwarded-for'].split(',')[0].trim() : '';
+    if (xff) return `xff:${xff}`;
+  }
+  return sockIp || 'local';
+}
+
+function issueSignedAccessToken(subject = 'user', passcodeValue = '') {
   const issuedAt = Date.now();
-  const payload = `${subject}.${issuedAt}`;
+  const cleanSubj = String(subject || 'user').trim();
+  const finalSubj = (cleanSubj === 'verified' && passcodeValue)
+    ? `verified:${getPasscodeVersionTag(passcodeValue)}`
+    : cleanSubj;
+  const payload = `${finalSubj}.${issuedAt}`;
   const sig = crypto
     .createHmac('sha256', getVaultKey())
     .update(payload)
@@ -1131,7 +1740,7 @@ function issueSignedAccessToken(subject = 'user') {
   return `${payload}.${sig}`;
 }
 
-function verifySignedAccessToken(token) {
+function verifySignedAccessToken(token, req = null) {
   const raw = String(token || '').trim();
   const parts = raw.split('.');
   if (parts.length !== 3) return false;
@@ -1143,7 +1752,58 @@ function verifySignedAccessToken(token) {
     .digest('hex');
   const bufA = Buffer.from(sig, 'utf8');
   const bufB = Buffer.from(expectedSig, 'utf8');
-  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+  if (bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB)) {
+    return false;
+  }
+  const issuedAt = Number(issuedAtStr);
+  if (!Number.isFinite(issuedAt) || issuedAt > Date.now() + 60000 || (Date.now() - issuedAt) > ACCESS_TOKEN_TTL_MS) {
+    return false;
+  }
+  try {
+    if (cloudLicense.isCloudLicenseEnforced() && subject !== 'cloud') {
+      return false;
+    }
+    const cfg = loadConfig(req);
+    const enabled = Boolean(cfg.USER_ACCESS_ENABLED);
+    const expected = typeof cfg.USER_ACCESS_CODE === 'string' ? cfg.USER_ACCESS_CODE.trim() : '';
+    if (enabled && expected) {
+      if (subject === 'open') return false;
+      if (subject.startsWith('verified:')) {
+        const tokenTag = subject.slice('verified:'.length);
+        if (tokenTag !== getPasscodeVersionTag(expected)) {
+          return false;
+        }
+      }
+    }
+  } catch (_) {
+    return false;
+  }
+  return true;
+}
+
+function extractCallerAccessToken(req) {
+  if (!req) return '';
+  const headerToken = typeof req.get === 'function'
+    ? (req.get('x-eza-access-token') || '')
+    : (req.headers && (req.headers['x-eza-access-token'] || ''));
+  if (headerToken && String(headerToken).trim()) return String(headerToken).trim();
+  const auth = typeof req.get === 'function'
+    ? (req.get('authorization') || '')
+    : (req.headers && (req.headers.authorization || ''));
+  if (typeof auth === 'string' && /^Bearer\s+/i.test(auth)) {
+    return auth.replace(/^Bearer\s+/i, '').trim();
+  }
+  const qToken = req.query && (req.query.accessToken || req.query.token);
+  return typeof qToken === 'string' ? qToken.trim() : '';
+}
+
+function isCallerAuthorized(req) {
+  const cfg = loadConfig(req);
+  const accessLocked = Boolean(cfg.USER_ACCESS_ENABLED && typeof cfg.USER_ACCESS_CODE === 'string' && cfg.USER_ACCESS_CODE.trim());
+  if (!accessLocked) return true;
+  if (isLoopbackNonForwardedRequest(req)) return true;
+  const token = extractCallerAccessToken(req);
+  return Boolean(token && verifySignedAccessToken(token, req));
 }
 
 const { spawn } = require('child_process');
@@ -1154,6 +1814,8 @@ let activePublicTunnel = {
   status: 'stopped',
   error: ''
 };
+let publicTunnelStartPromise = null;
+let settlePendingTunnelStart = null;
 
 function startPublicInternetTunnel(targetPort = 3001) {
   if (activePublicTunnel.proc && activePublicTunnel.url) {
@@ -1164,19 +1826,29 @@ function startPublicInternetTunnel(targetPort = 3001) {
       status: 'running'
     });
   }
+  if (publicTunnelStartPromise) {
+    return publicTunnelStartPromise;
+  }
   stopPublicInternetTunnel();
 
   const port = Number(process.env.PORT) || Number(targetPort) || 3001;
   const localCloudflared = path.join(__dirname, '..', '..', '..', 'tools', 'cloudflared.exe');
   const hasLocalCloudflared = fs.existsSync(localCloudflared);
 
-  return new Promise((resolve) => {
+  const runPromise = new Promise((resolve) => {
     let settled = false;
+    let fallbackTimeout = null;
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      if (settlePendingTunnelStart === finish) settlePendingTunnelStart = null;
+      if (fallbackTimeout) {
+        clearTimeout(fallbackTimeout);
+        fallbackTimeout = null;
+      }
       resolve(result);
     };
+    settlePendingTunnelStart = finish;
 
     const launchSshFallback = () => {
       activePublicTunnel.provider = 'localhost.run (SSH HTTPS)';
@@ -1185,9 +1857,10 @@ function startPublicInternetTunnel(targetPort = 3001) {
       const sshBin = process.platform === 'win32' && fs.existsSync('C:\\Windows\\System32\\OpenSSH\\ssh.exe')
         ? 'C:\\Windows\\System32\\OpenSSH\\ssh.exe'
         : 'ssh';
+      const nullKnownHosts = process.platform === 'win32' ? 'NUL' : '/dev/null';
       const proc = spawn(sshBin, [
         '-o', 'StrictHostKeyChecking=no',
-        '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', `UserKnownHostsFile=${nullKnownHosts}`,
         '-o', 'ServerAliveInterval=30',
         '-R', `80:127.0.0.1:${port}`,
         'nokey@localhost.run'
@@ -1253,12 +1926,27 @@ function startPublicInternetTunnel(targetPort = 3001) {
       };
       proc.stdout.on('data', onCfChunk);
       proc.stderr.on('data', onCfChunk);
-      proc.on('error', () => launchSshFallback());
+      proc.on('error', () => {
+        if (activePublicTunnel.proc === proc && !activePublicTunnel.url) {
+          launchSshFallback();
+        }
+      });
+      proc.on('exit', () => {
+        if (activePublicTunnel.proc === proc) {
+          activePublicTunnel.proc = null;
+          if (!activePublicTunnel.url) {
+            launchSshFallback();
+          } else {
+            activePublicTunnel.status = 'stopped';
+            activePublicTunnel.url = '';
+          }
+        }
+      });
     } else {
       launchSshFallback();
     }
 
-    setTimeout(() => {
+    fallbackTimeout = setTimeout(() => {
       if (!settled) {
         finish({
           success: Boolean(activePublicTunnel.url),
@@ -1269,7 +1957,12 @@ function startPublicInternetTunnel(targetPort = 3001) {
         });
       }
     }, 8500);
+  }).finally(() => {
+    publicTunnelStartPromise = null;
   });
+
+  publicTunnelStartPromise = runPromise;
+  return runPromise;
 }
 
 function stopPublicInternetTunnel() {
@@ -1285,28 +1978,49 @@ function stopPublicInternetTunnel() {
     status: 'stopped',
     error: ''
   };
+  if (typeof settlePendingTunnelStart === 'function') {
+    try {
+      settlePendingTunnelStart({ success: false, status: 'stopped', url: '' });
+    } catch (_) {}
+  }
+  publicTunnelStartPromise = null;
   return { success: true, status: 'stopped', url: '' };
 }
 
 function getSystemHubSnapshot(req) {
   const cfg = loadConfig(req);
-  const net = detectLanAddresses(3001);
+  const localPort = Number(process.env.PORT) || (req && req.socket && req.socket.localPort) || 3001;
+  const net = detectLanAddresses(localPort);
   const machineId = getMachineHardwareId();
-  const isPackagedClient = process.env.EZA_PACKAGED_CLIENT === '1';
+  const isPackagedClient = process.env.EZA_PACKAGED === '1' || process.env.EZA_PACKAGED_CLIENT === '1';
   const cloudEnforced = cloudLicense.isCloudLicenseEnforced();
   const cloudSummary = cloudEnforced ? cloudLicense.getCloudLicenseSummary(machineId) : null;
   const remoteSettings = (cloudSummary && cloudSummary.remoteSettings) || {};
+  const cloudCfg = cloudLicense.loadCloudLicenseConfig();
+  let appVersion = '1.0.0';
+  try { appVersion = require('../../../package.json').version || '1.0.0'; } catch (_) {}
+  const supportContact = (cloudSummary && cloudSummary.supportContact) || remoteSettings.supportContact || cloudCfg.defaultSupportContact || 'https://t.me/ezapro_support';
   return {
     ...net,
+    appVersion,
     machineId,
     isPackagedClient,
     cloudLicenseEnforced: cloudEnforced,
     cloudLicensed: Boolean(cloudSummary && cloudSummary.licensed),
+    supportContact,
     cloudLicenseInfo: cloudSummary
       ? {
+          planId: cloudSummary.planId || '',
+          priceUsd: cloudSummary.priceUsd || 0,
+          warrantySupport: cloudSummary.warrantySupport || 'standard_warranty',
           customerName: cloudSummary.customerName || '',
           maskedKey: cloudSummary.maskedKey || '',
-          expiresAt: cloudSummary.expiresAt || null
+          expiresAt: cloudSummary.expiresAt || null,
+          remainingDays: cloudSummary.remainingDays,
+          expiringSoon: Boolean(cloudSummary.expiringSoon),
+          maxMachines: cloudSummary.maxMachines || 1,
+          boundCount: cloudSummary.boundCount || 0,
+          supportContact
         }
       : null,
     publicTunnelUrl: activePublicTunnel.url || '',
@@ -1319,13 +2033,17 @@ function getSystemHubSnapshot(req) {
       (typeof cfg.MAINTENANCE_BANNER === 'string' ? cfg.MAINTENANCE_BANNER : ''),
     maintenanceLocked: Boolean(cfg.MAINTENANCE_LOCKED),
     downloadUrl: (cloudEnforced && remoteSettings.downloadUrl) || '',
-    routerDefaultLocked: (cloudEnforced && remoteSettings.routerLocked) || Boolean(cfg.ROUTER_DEFAULT_LOCKED)
+    routerDefaultLocked: false
   };
 }
 
 router.post('/public-tunnel/start', async (req, res) => {
   try {
-    const result = await startPublicInternetTunnel(3001);
+    if (!isLoopbackNonForwardedRequest(req)) {
+      return res.status(403).json({ success: false, error: 'Public tunnel control is restricted to local host only.' });
+    }
+    const localPort = Number(process.env.PORT) || (req && req.socket && req.socket.localPort) || 3001;
+    const result = await startPublicInternetTunnel(localPort);
     return res.json({
       ...result,
       ...getSystemHubSnapshot(req)
@@ -1337,6 +2055,9 @@ router.post('/public-tunnel/start', async (req, res) => {
 
 router.post('/public-tunnel/stop', (req, res) => {
   try {
+    if (!isLoopbackNonForwardedRequest(req)) {
+      return res.status(403).json({ success: false, error: 'Public tunnel control is restricted to local host only.' });
+    }
     stopPublicInternetTunnel();
     return res.json({
       success: true,
@@ -1349,9 +2070,27 @@ router.post('/public-tunnel/stop', (req, res) => {
 
 router.get('/system-hub', (req, res) => {
   try {
+    const snap = getSystemHubSnapshot(req);
+    if (!isLoopbackNonForwardedRequest(req) && !isCallerAuthorized(req)) {
+      return res.json({
+        success: true,
+        appVersion: snap.appVersion,
+        isPackagedClient: snap.isPackagedClient,
+        cloudLicenseEnforced: snap.cloudLicenseEnforced,
+        cloudLicensed: snap.cloudLicensed,
+        supportContact: snap.supportContact,
+        cloudLicenseInfo: snap.cloudLicenseInfo,
+        userAccessEnabled: snap.userAccessEnabled,
+        hasUserAccessCode: snap.hasUserAccessCode,
+        maintenanceBanner: snap.maintenanceBanner,
+        maintenanceLocked: snap.maintenanceLocked,
+        downloadUrl: snap.downloadUrl,
+        routerDefaultLocked: snap.routerDefaultLocked
+      });
+    }
     return res.json({
       success: true,
-      ...getSystemHubSnapshot(req)
+      ...snap
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
@@ -1360,7 +2099,15 @@ router.get('/system-hub', (req, res) => {
 
 router.post('/system-hub', (req, res) => {
   try {
-    if (process.env.EZA_PACKAGED_CLIENT === '1' && process.env.EZA_ADMIN_TOOLS !== '1') {
+    if (!isLoopbackNonForwardedRequest(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'System Hub settings are restricted to local host only.'
+      });
+    }
+    const isPackaged = process.env.EZA_PACKAGED === '1' || process.env.EZA_PACKAGED_CLIENT === '1';
+    const allowAdminOverride = process.env.EZA_ADMIN_TOOLS === '1' && process.env.EZA_PACKAGED !== '1';
+    if (isPackaged && !allowAdminOverride) {
       return res.status(403).json({
         success: false,
         error: 'System Hub admin settings are disabled in packaged client builds.'
@@ -1396,7 +2143,15 @@ router.post('/system-hub', (req, res) => {
 
 router.post('/generate-license', (req, res) => {
   try {
-    if (process.env.EZA_PACKAGED_CLIENT === '1' && process.env.EZA_ADMIN_TOOLS !== '1') {
+    if (!isLoopbackNonForwardedRequest(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'License generator is restricted to local host only.'
+      });
+    }
+    const isPackaged = process.env.EZA_PACKAGED === '1' || process.env.EZA_PACKAGED_CLIENT === '1';
+    const allowAdminOverride = process.env.EZA_ADMIN_TOOLS === '1' && process.env.EZA_PACKAGED !== '1';
+    if (isPackaged && !allowAdminOverride) {
       return res.status(403).json({
         success: false,
         error: 'License generator is disabled in packaged client builds.'
@@ -1426,7 +2181,13 @@ router.post('/generate-license', (req, res) => {
 
 router.post('/verify-access', async (req, res) => {
   try {
-    const clientIp = String(req.ip || (req.socket && req.socket.remoteAddress) || 'local');
+    const clientIp = getRateLimitClientKey(req);
+    if (accessFailedAttempts.size > 500) {
+      const nowCleanup = Date.now();
+      for (const [k, v] of accessFailedAttempts.entries()) {
+        if (!v || (v.lockedUntil && v.lockedUntil < nowCleanup)) accessFailedAttempts.delete(k);
+      }
+    }
     const attemptEntry = accessFailedAttempts.get(clientIp);
     if (attemptEntry && attemptEntry.lockedUntil > Date.now()) {
       const waitSec = Math.ceil((attemptEntry.lockedUntil - Date.now()) / 1000);
@@ -1479,8 +2240,10 @@ router.post('/verify-access', async (req, res) => {
           cloudLicenseEnforced: true,
           reason: result.reason,
           error: result.error || 'License Key មិនត្រឹមត្រូវទេ។',
+          minAppVersion: result.minAppVersion || '',
           maintenanceBanner: result.maintenanceBanner || '',
-          downloadUrl: result.downloadUrl || ''
+          downloadUrl: result.downloadUrl || '',
+          supportContact: result.supportContact || ''
         });
       }
 
@@ -1491,14 +2254,23 @@ router.post('/verify-access', async (req, res) => {
         cloudLicenseEnforced: true,
         source: result.source,
         accessToken: issueSignedAccessToken('cloud'),
+        supportContact: result.supportContact || '',
         cloudLicenseInfo: {
+          planId: result.planId || '',
+          priceUsd: result.priceUsd || 0,
+          warrantySupport: result.warrantySupport || 'standard_warranty',
           customerName: result.customerName || '',
           maskedKey: result.maskedKey || '',
-          expiresAt: result.expiresAt || null
+          expiresAt: result.expiresAt || null,
+          remainingDays: result.remainingDays,
+          expiringSoon: Boolean(result.expiringSoon),
+          maxMachines: result.maxMachines || 1,
+          boundCount: result.boundCount || 1,
+          supportContact: result.supportContact || ''
         },
         maintenanceBanner: result.maintenanceBanner || '',
         downloadUrl: result.downloadUrl || '',
-        routerLocked: Boolean(result.routerLocked)
+        routerLocked: false
       });
     }
 
@@ -1511,7 +2283,7 @@ router.post('/verify-access', async (req, res) => {
     if (!enabled || !expected) {
       return res.json({ success: true, valid: true, accessToken: issueSignedAccessToken('open') });
     }
-    if (providedToken && verifySignedAccessToken(providedToken)) {
+    if (providedToken && verifySignedAccessToken(providedToken, req)) {
       return res.json({ success: true, valid: true, accessToken: providedToken });
     }
 
@@ -1539,7 +2311,7 @@ router.post('/verify-access', async (req, res) => {
     return res.status(200).json({
       success: true,
       valid: true,
-      accessToken: issueSignedAccessToken('verified'),
+      accessToken: issueSignedAccessToken('verified', expected),
       expiresTag: licCheck.valid ? licCheck.expiresTag : 'PASSCODE'
     });
   } catch (err) {
@@ -1560,6 +2332,8 @@ module.exports.hashAccessPasscode = hashAccessPasscode;
 module.exports.verifyHashedPasscode = verifyHashedPasscode;
 module.exports.issueSignedAccessToken = issueSignedAccessToken;
 module.exports.verifySignedAccessToken = verifySignedAccessToken;
+module.exports.isLoopbackNonForwardedRequest = isLoopbackNonForwardedRequest;
+module.exports.isCallerAuthorized = isCallerAuthorized;
 module.exports.getActiveGeminiApiKey = getActiveGeminiApiKey;
 module.exports.getSafeGeminiAccounts = getSafeGeminiAccounts;
 module.exports.addGeminiAccountRecord = addGeminiAccountRecord;
@@ -1576,3 +2350,14 @@ module.exports.getGeminiApiKeyCandidates = getGeminiApiKeyCandidates;
 module.exports.markGeminiKeyRateLimited = markGeminiKeyRateLimited;
 module.exports.markGeminiKeyHealthy = markGeminiKeyHealthy;
 module.exports.isGeminiKeyRateLimited = isGeminiKeyRateLimited;
+module.exports.stopPublicInternetTunnel = stopPublicInternetTunnel;
+module.exports.flushUsageStats = flushUsageStats;
+module.exports.getActivePublicTunnelUrl = () => activePublicTunnel.url || '';
+module.exports.getRespanRuntimeConfig = getRespanRuntimeConfig;
+module.exports.getSafeRespanSnapshot = getSafeRespanSnapshot;
+module.exports.saveRespanConfigRecord = saveRespanConfigRecord;
+module.exports.beginRespanStream = beginRespanStream;
+module.exports.markRespanRateLimited = markRespanRateLimited;
+module.exports.markRespanHealthy = markRespanHealthy;
+module.exports.isRespanRateLimited = isRespanRateLimited;
+module.exports.probeRespanConnection = probeRespanConnection;

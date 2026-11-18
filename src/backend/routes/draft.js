@@ -8,8 +8,55 @@ const router = express.Router();
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { mapWithConcurrency, renameFileSafe } = require('../utils/ffmpeg');
 
 const DEFAULT_DRAFTS_DIR = path.join(__dirname, '..', '..', '..', 'drafts');
+const draftWriteQueues = new Map();
+
+function getDraftKey(videoPath) {
+  const clean = typeof videoPath === 'string' ? videoPath.trim() : '';
+  if (!clean) return '';
+  const normalized = path.normalize(clean);
+  const canonical = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  return crypto.createHash('md5').update(canonical).digest('hex');
+}
+
+function resolveExistingDraftPath(draftsDir, videoPath) {
+  const clean = typeof videoPath === 'string' ? videoPath.trim() : '';
+  const canonicalKey = getDraftKey(clean);
+  const canonicalPath = canonicalKey ? path.join(draftsDir, `${canonicalKey}.json`) : '';
+  if (canonicalPath && fs.existsSync(canonicalPath)) {
+    return { key: canonicalKey, draftPath: canonicalPath };
+  }
+  if (clean) {
+    const candidates = [
+      path.normalize(clean),
+      clean
+    ];
+    for (const candidateStr of candidates) {
+      const legacyKey = crypto.createHash('md5').update(candidateStr).digest('hex');
+      if (legacyKey && legacyKey !== canonicalKey) {
+        const legacyPath = path.join(draftsDir, `${legacyKey}.json`);
+        if (fs.existsSync(legacyPath)) {
+          return { key: legacyKey, draftPath: legacyPath };
+        }
+      }
+    }
+  }
+  return { key: canonicalKey, draftPath: canonicalPath };
+}
+
+function enqueueDraftWrite(key, fn) {
+  const prev = draftWriteQueues.get(key) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  draftWriteQueues.set(key, next);
+  next.finally(() => {
+    if (draftWriteQueues.get(key) === next) {
+      draftWriteQueues.delete(key);
+    }
+  });
+  return next;
+}
 
 function getDraftsDir() {
   return process.env.DRAFTS_DIR || DEFAULT_DRAFTS_DIR;
@@ -50,55 +97,71 @@ router.post('/save', async (req, res) => {
       });
     }
 
-    // Generate unique key from video path
-    const key = crypto.createHash('md5').update(cleanVideoPath).digest('hex');
+    // Generate canonical key from normalized video path with serialized per-key atomic saves
+    const key = getDraftKey(cleanVideoPath);
     const draftsDir = ensureDraftsDir();
     const draftPath = path.join(draftsDir, `${key}.json`);
     const incomingTranslatedCount = cues.filter(c =>
       c && typeof c.translated === 'string' && c.translated.trim() && (Boolean(c.translatedLang) || c.translated !== c.text)
     ).length;
 
-    // Never let background auto-save overwrite an existing translated draft with raw untranslated cues
-    if (isAutoSave && incomingTranslatedCount === 0 && fs.existsSync(draftPath)) {
-      try {
-        const existingDraft = JSON.parse(fs.readFileSync(draftPath, 'utf8'));
-        const existingTranslated = Array.isArray(existingDraft && existingDraft.cues)
-          ? existingDraft.cues.filter(c => c && typeof c.translated === 'string' && c.translated.trim() && (Boolean(c.translatedLang) || c.translated !== c.text)).length
-          : 0;
-        if (existingTranslated > 0) {
-          return res.json({
-            success: true,
-            skippedOverwrite: true,
-            message: 'Preserved existing translated draft',
-            draftKey: key,
-            savedPath: draftPath,
-            cueCount: existingDraft.cues.length
-          });
-        }
-      } catch (_) {}
-    }
-    
-    // Prepare draft data
-    const draftData = { 
-      cues, 
-      videoPath: cleanVideoPath,
-      videoName: (typeof videoName === 'string' && videoName.trim()) || path.basename(cleanVideoPath),
-      timestamp: timestamp || Date.now(),
-      cueCount: cues.length,
-      translatedCount: incomingTranslatedCount,
-      lastModified: new Date().toISOString(),
-      version: '1.0'
-    };
+    const existingCheck = resolveExistingDraftPath(draftsDir, cleanVideoPath);
 
-    // Save to file
-    fs.writeFileSync(draftPath, JSON.stringify(draftData, null, 2), 'utf8');
-    
-    res.json({ 
-      success: true, 
-      message: 'Draft saved successfully',
-      draftKey: key, 
-      savedPath: draftPath,
-      cueCount: cues.length
+    const saveResult = await enqueueDraftWrite(key, async () => {
+      // Never let background auto-save overwrite an existing translated draft with raw untranslated cues
+      const checkAutoPath = fs.existsSync(draftPath) ? draftPath : existingCheck.draftPath;
+      if (isAutoSave && incomingTranslatedCount === 0 && fs.existsSync(checkAutoPath)) {
+        try {
+          const existingDraft = JSON.parse(await fs.promises.readFile(checkAutoPath, 'utf8'));
+          const existingTranslated = Array.isArray(existingDraft && existingDraft.cues)
+            ? existingDraft.cues.filter(c => c && typeof c.translated === 'string' && c.translated.trim() && (Boolean(c.translatedLang) || c.translated !== c.text)).length
+            : 0;
+          if (existingTranslated > 0) {
+            return {
+              skippedOverwrite: true,
+              message: 'Preserved existing translated draft',
+              draftKey: existingCheck.key || key,
+              savedPath: checkAutoPath,
+              cueCount: existingDraft.cues.length
+            };
+          }
+        } catch (_) {}
+      }
+
+      const parsedTs = typeof timestamp === 'number'
+        ? timestamp
+        : (typeof timestamp === 'string' && timestamp.trim() ? Date.parse(timestamp) : NaN);
+      const draftData = {
+        cues,
+        videoPath: path.normalize(cleanVideoPath),
+        videoName: (typeof videoName === 'string' && videoName.trim()) || path.basename(cleanVideoPath),
+        timestamp: Number.isFinite(parsedTs) ? parsedTs : Date.now(),
+        cueCount: cues.length,
+        translatedCount: incomingTranslatedCount,
+        lastModified: new Date().toISOString(),
+        version: '1.0'
+      };
+
+      const tmpPath = `${draftPath}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        await fs.promises.writeFile(tmpPath, JSON.stringify(draftData, null, 2), 'utf8');
+        await renameFileSafe(tmpPath, draftPath);
+      } finally {
+        try { if (fs.existsSync(tmpPath)) await fs.promises.unlink(tmpPath); } catch (_) {}
+      }
+
+      return {
+        skippedOverwrite: false,
+        message: 'Draft saved successfully',
+        draftKey: key,
+        savedPath: draftPath,
+        cueCount: cues.length
+      };
+    });
+
+    res.json({
+      success: true,
+      ...saveResult
     });
   } catch (e) {
     console.error('[drafts/save]:', e);
@@ -110,11 +173,13 @@ router.post('/save', async (req, res) => {
  * POST /api/drafts/load
  * Load draft by video path
  */
-router.post('/load', (req, res) => {
+router.post('/load', async (req, res) => {
   try {
     const { videoPath, draftKey } = req.body || {};
     
     let key;
+    let draftPath;
+    const draftsDir = ensureDraftsDir();
     if (draftKey !== undefined && draftKey !== null && draftKey !== '') {
       if (typeof draftKey !== 'string' || !/^[a-f0-9]{32}$/.test(draftKey.trim())) {
         return res.status(400).json({
@@ -123,20 +188,24 @@ router.post('/load', (req, res) => {
         });
       }
       key = draftKey.trim();
+      draftPath = path.join(draftsDir, `${key}.json`);
     } else if (typeof videoPath === 'string' && videoPath.trim()) {
-      key = crypto.createHash('md5').update(videoPath.trim()).digest('hex');
+      const resolved = resolveExistingDraftPath(draftsDir, videoPath.trim());
+      key = resolved.key;
+      draftPath = resolved.draftPath;
     } else {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'videoPath or draftKey required' 
+      return res.status(400).json({
+        success: false,
+        error: 'videoPath or draftKey required'
       });
     }
 
-    const draftsDir = ensureDraftsDir();
-    const draftPath = path.join(draftsDir, `${key}.json`);
-    
+    const pendingWrite = draftWriteQueues.get(key);
+    if (pendingWrite) {
+      await pendingWrite.catch(() => {});
+    }
     if (fs.existsSync(draftPath)) {
-      const draft = JSON.parse(fs.readFileSync(draftPath, 'utf8'));
+      const draft = JSON.parse(await fs.promises.readFile(draftPath, 'utf8'));
       return res.json({ 
         success: true, 
         draft, 
@@ -161,40 +230,45 @@ router.post('/load', (req, res) => {
  * GET /api/drafts/list
  * List all saved drafts
  */
-router.get('/list', (req, res) => {
+router.get('/list', async (req, res) => {
   try {
     const draftsDir = getDraftsDir();
     if (!fs.existsSync(draftsDir)) {
       return res.json({ success: true, drafts: [], total: 0 });
     }
 
-    const files = fs.readdirSync(draftsDir)
-      .filter(f => f.endsWith('.json'))
-      .map(f => {
-        const filePath = path.join(draftsDir, f);
-        try {
-          const stats = fs.statSync(filePath);
-          const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-          
-          return {
-            key: path.basename(f, '.json'),
-            fileName: f,
-            videoPath: data.videoPath || 'Unknown',
-            videoName: data.videoName || path.basename(data.videoPath || ''),
-            cueCount: data.cueCount || data.cues?.length || 0,
-            translatedCount: data.translatedCount || 0,
-            timestamp: data.timestamp || stats.mtimeMs,
-            lastModified: data.lastModified || stats.mtime.toISOString(),
-            size: stats.size,
-            sizeReadable: (stats.size / 1024).toFixed(1) + ' KB'
-          };
-        } catch (err) {
-          console.warn('Failed to read draft:', f, err.message);
-          return null;
-        }
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.timestamp - a.timestamp);
+    const entries = await fs.promises.readdir(draftsDir);
+    const jsonFiles = entries.filter(f => f.endsWith('.json'));
+    const readResults = await mapWithConcurrency(jsonFiles, 12, async (f) => {
+      const filePath = path.join(draftsDir, f);
+      try {
+        const [stats, raw] = await Promise.all([
+          fs.promises.stat(filePath),
+          fs.promises.readFile(filePath, 'utf8')
+        ]);
+        const data = JSON.parse(raw);
+        const rawTs = typeof data.timestamp === 'number'
+          ? data.timestamp
+          : (typeof data.timestamp === 'string' && data.timestamp.trim() ? Date.parse(data.timestamp) : NaN);
+        return {
+          key: path.basename(f, '.json'),
+          fileName: f,
+          videoPath: data.videoPath || 'Unknown',
+          videoName: data.videoName || path.basename(data.videoPath || ''),
+          cueCount: data.cueCount || data.cues?.length || 0,
+          translatedCount: data.translatedCount || 0,
+          timestamp: Number.isFinite(rawTs) ? rawTs : stats.mtimeMs,
+          lastModified: data.lastModified || stats.mtime.toISOString(),
+          size: stats.size,
+          sizeReadable: (stats.size / 1024).toFixed(1) + ' KB'
+        };
+      } catch (err) {
+        console.warn('Failed to read draft:', f, err.message);
+        return null;
+      }
+    });
+
+    const files = readResults.filter(Boolean).sort((a, b) => b.timestamp - a.timestamp);
 
     res.json({ 
       success: true, 
@@ -211,7 +285,7 @@ router.get('/list', (req, res) => {
  * DELETE /api/drafts/:key
  * Delete a specific draft
  */
-router.delete('/:key', (req, res) => {
+router.delete('/:key', async (req, res) => {
   try {
     const { key } = req.params;
     
@@ -224,9 +298,14 @@ router.delete('/:key', (req, res) => {
 
     const draftsDir = ensureDraftsDir();
     const draftPath = path.join(draftsDir, `${key}.json`);
-    
-    if (fs.existsSync(draftPath)) {
-      fs.unlinkSync(draftPath);
+    const deleted = await enqueueDraftWrite(key, async () => {
+      if (fs.existsSync(draftPath)) {
+        await fs.promises.unlink(draftPath);
+        return true;
+      }
+      return false;
+    });
+    if (deleted) {
       return res.json({ 
         success: true, 
         message: 'Draft deleted successfully' 
@@ -247,19 +326,26 @@ router.delete('/:key', (req, res) => {
  * DELETE /api/drafts/clear/all
  * Clear all drafts
  */
-router.delete('/clear/all', (req, res) => {
+router.delete('/clear/all', async (req, res) => {
   try {
     const draftsDir = getDraftsDir();
     if (!fs.existsSync(draftsDir)) {
       return res.json({ success: true, message: 'Deleted 0 drafts', deletedCount: 0 });
     }
+    await Promise.all([...draftWriteQueues.values()].map(p => p.catch(() => {})));
     const files = fs.readdirSync(draftsDir);
     let deletedCount = 0;
 
     for (const file of files) {
       if (file.endsWith('.json')) {
-        fs.unlinkSync(path.join(draftsDir, file));
-        deletedCount++;
+        const key = file.replace(/\.json$/i, '');
+        await enqueueDraftWrite(key, async () => {
+          const target = path.join(draftsDir, file);
+          if (fs.existsSync(target)) {
+            await fs.promises.unlink(target);
+            deletedCount++;
+          }
+        });
       }
     }
 
@@ -272,5 +358,8 @@ router.delete('/clear/all', (req, res) => {
     res.status(500).json({ success: false, error: e.message });
   }
 });
+
+router.getDraftKey = getDraftKey;
+router.resolveExistingDraftPath = resolveExistingDraftPath;
 
 module.exports = router;

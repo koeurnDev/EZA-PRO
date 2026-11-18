@@ -31,6 +31,7 @@ uploads/
 # Draft files (may contain user data)
 drafts/*
 !drafts/.gitkeep
+series_glossaries/
 
 # Export directory
 Exported/
@@ -68,3 +69,9 @@ cloudflare-license-worker/.admin-credentials.local.txt
 cloudflare-license-worker/.wrangler/
 *.local.txt
 dist/
+
+# Local AI stem separation venv, models, and caches
+.venv_audio/
+.ai_models/
+.pip_cache/
+.tmp_py/

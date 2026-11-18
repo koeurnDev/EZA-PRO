@@ -86,7 +86,19 @@ def run_conversion(args: argparse.Namespace) -> int:
             "--fp16",
             use_fp16,
         ]
-        proc = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            print("Seed-VC timed out after 300s", file=sys.stderr)
+            return 6
         if proc.returncode != 0:
             err_tail = (proc.stderr or proc.stdout or "").strip()[-1500:]
             print(f"Seed-VC failed (exit {proc.returncode}): {err_tail}", file=sys.stderr)
@@ -97,8 +109,20 @@ def run_conversion(args: argparse.Namespace) -> int:
             print("Seed-VC produced no WAV output", file=sys.stderr)
             return 5
 
-        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-        shutil.copyfile(wav_path, os.path.abspath(args.output))
+        out_abs = os.path.abspath(args.output)
+        out_dir = os.path.dirname(out_abs)
+        os.makedirs(out_dir, exist_ok=True)
+        tmp_out = f"{out_abs}.{os.getpid()}.tmp.wav"
+        try:
+            shutil.copyfile(wav_path, tmp_out)
+            os.replace(tmp_out, out_abs)
+        except Exception:
+            try:
+                if os.path.exists(tmp_out):
+                    os.unlink(tmp_out)
+            except Exception:
+                pass
+            raise
 
     return 0
 
