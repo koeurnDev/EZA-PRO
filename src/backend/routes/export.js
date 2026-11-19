@@ -67,6 +67,52 @@ function getExportDir() {
   return process.env.EXPORT_DIR || EXPORT_DIR;
 }
 
+function probeDirectoryWritable(dirPath) {
+  if (!dirPath || typeof dirPath !== 'string') return { ok: false, code: 'EINVAL', message: 'Invalid path' };
+  try {
+    fs.mkdirSync(dirPath, { recursive: true });
+    const probeFile = path.join(dirPath, `.eza_write_probe_${process.pid}_${Date.now()}.tmp`);
+    fs.writeFileSync(probeFile, 'ok', 'utf8');
+    fs.unlinkSync(probeFile);
+    return { ok: true, code: null, message: '' };
+  } catch (err) {
+    return {
+      ok: false,
+      code: (err && err.code) || 'EACCES',
+      message: (err && err.message) || 'Cannot write to directory'
+    };
+  }
+}
+
+function resolveWritableExportDir(requestedDir = '') {
+  const trimmed = typeof requestedDir === 'string' ? requestedDir.trim() : '';
+  if (trimmed) {
+    const normalized = path.normalize(trimmed);
+    const probe = probeDirectoryWritable(normalized);
+    return { dir: normalized, writable: probe.ok, isFallback: false, probe };
+  }
+  const primary = path.normalize(getExportDir());
+  const primaryProbe = probeDirectoryWritable(primary);
+  if (primaryProbe.ok) {
+    return { dir: primary, writable: true, isFallback: false, probe: primaryProbe };
+  }
+  const homeDir = os.homedir();
+  const fallbackCandidates = [
+    homeDir ? path.join(homeDir, 'Downloads', 'EZA PRO Exported') : '',
+    process.env.EZA_USER_DATA_DIR ? path.join(process.env.EZA_USER_DATA_DIR, 'Exported') : '',
+    path.join(os.tmpdir(), 'EZA PRO Exported')
+  ].filter(Boolean).map(p => path.normalize(p));
+  for (const cand of fallbackCandidates) {
+    if (cand.toLowerCase() === primary.toLowerCase()) continue;
+    const probe = probeDirectoryWritable(cand);
+    if (probe.ok) {
+      logWarn('export:dir', `Default export folder blocked (${primary} -> ${primaryProbe.code}), using fallback: ${cand}`);
+      return { dir: cand, writable: true, isFallback: true, primaryDir: primary, probe };
+    }
+  }
+  return { dir: primary, writable: false, isFallback: false, probe: primaryProbe };
+}
+
 try {
   if (!fs.existsSync(getExportDir())) {
     fs.mkdirSync(getExportDir(), { recursive: true });
@@ -1034,8 +1080,10 @@ function parseMediaInfoFromStderr(stderr) {
     if (totalBrMatch) videoBitrateKbps = parseInt(totalBrMatch[1], 10) || 0;
   }
 
-  const hasAudio = /Stream #\d+:\d+[^:]*:\s*Audio:/m.test(stderr);
-  return { durationSec, width, height, hasAudio, videoBitrateKbps };
+  const audioMatch = stderr.match(/Stream #\d+:\d+[^:]*:\s*Audio:([^\r\n]*)/m);
+  const hasAudio = Boolean(audioMatch);
+  const audioChannels = audioMatch ? (/\bmono\b|\b1 channels?\b/i.test(audioMatch[1]) ? 1 : 2) : 2;
+  return { durationSec, width, height, hasAudio, audioChannels, videoBitrateKbps };
 }
 
 function probeMediaInfo(filePath) {
@@ -1750,7 +1798,8 @@ function buildAudioMixGraph({
   bgVolume = 0.28,
   dubVolume = 1.25,
   bgmOnPause = true,
-  sourceAudioTransform = ''
+  sourceAudioTransform = '',
+  sourceBgmFilter = ''
 }) {
   const safeDur = Math.max(0.1, Number.isFinite(Number(durationSec)) && Number(durationSec) > 0 ? Number(durationSec) : 120).toFixed(3);
   const parsedBg = Number(bgVolume);
@@ -1761,8 +1810,11 @@ function buildAudioMixGraph({
   const safeDubVolNum = Number.isFinite(parsedDub) ? Math.min(2.0, Math.max(0, parsedDub)) : 1.25;
   const safeDubVol = safeDubVolNum.toFixed(2);
   const srcTail = typeof sourceAudioTransform === 'string' ? sourceAudioTransform : '';
+  const effectiveBgmFilter = (typeof sourceBgmFilter === 'string' && sourceBgmFilter.trim())
+    ? sourceBgmFilter.trim()
+    : audioRouter.BGM_ISOLATION_FILTER;
   const dubNorm = `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=${safeDubVol},apad=whole_dur=${safeDur},atrim=0:${safeDur},asetpts=PTS-STARTPTS`;
-  const bgmIsoPad = `[0:a]${audioRouter.BGM_ISOLATION_FILTER}${srcTail},apad=whole_dur=${safeDur},atrim=0:${safeDur},asetpts=PTS-STARTPTS`;
+  const bgmIsoPad = `[0:a]${effectiveBgmFilter}${srcTail},apad=whole_dur=${safeDur},atrim=0:${safeDur},asetpts=PTS-STARTPTS`;
 
   if (!hasSourceAudio || audioMixMode === 'dub_only') {
     return `${dubNorm},dynaudnorm=f=150:g=15:p=0.9,alimiter=limit=0.95[aout]`;
@@ -1825,7 +1877,7 @@ function buildAudioMixGraph({
       ? `[2:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo${srcTail},volume=${stemBgmVol},apad=whole_dur=${safeDur},atrim=0:${safeDur},asetpts=PTS-STARTPTS[bg]`
       : `${bgmIsoPad},volume=${dspBgmVol}[bg]`;
     const scExpr = hasIsolatedBgmInput
-      ? 'threshold=0.14:ratio=2.2:attack=25:release=260'
+      ? 'threshold=0.16:ratio=2.0:attack=25:release=260'
       : 'threshold=0.06:ratio=3.5:attack=20:release=320';
     return `${bgmSource};${dubNorm}[dubfull];[dubfull]asplit=2[dub][sc];[bg][sc]sidechaincompress=${scExpr}[bg_ducked];[bg_ducked][dub]amix=inputs=2:duration=first:normalize=0:dropout_transition=0,alimiter=limit=0.95[aout]`;
   }
@@ -2102,7 +2154,8 @@ router.post('/video', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid or empty cues array' });
     }
     let exportDir = getExportDir();
-    if (outputDir !== undefined && outputDir !== null && String(outputDir).trim()) {
+    const hasExplicitOutputDir = outputDir !== undefined && outputDir !== null && String(outputDir).trim();
+    if (hasExplicitOutputDir) {
       if (typeof outputDir !== 'string' || !path.isAbsolute(outputDir.trim())) {
         return res.status(400).json({ success: false, error: 'outputDir must be an absolute path' });
       }
@@ -2110,6 +2163,22 @@ router.post('/video', async (req, res) => {
       if (isBlockedNetworkOrStreamPath(outputDir, exportDir)) {
         return res.status(403).json({ success: false, error: 'Invalid or forbidden outputDir.' });
       }
+      const dirProbe = probeDirectoryWritable(exportDir);
+      if (!dirProbe.ok) {
+        return res.status(403).json({
+          success: false,
+          error: `មិនអាចបង្កើតឯកសារ Export ក្នុង Folder "${exportDir}" បានទេ (${dirProbe.code || dirProbe.message}) — អាចជាប់ការពារដោយ Windows Controlled Folder Access (ឧ. Folder Videos)។ សូមរើស Folder ផ្សេង (ដូចជា Downloads) ឬបើកសិទ្ធិឲ្យកម្មវិធី។`
+        });
+      }
+    } else {
+      const resolvedDir = resolveWritableExportDir('');
+      if (!resolvedDir.writable) {
+        return res.status(500).json({
+          success: false,
+          error: `រកមិនឃើញ Folder ដែលអាចសរសេរ Export បានទេ (${resolvedDir.probe?.code || resolvedDir.probe?.message || 'Permission denied'})។`
+        });
+      }
+      exportDir = resolvedDir.dir;
     }
 
     const normalizedVideoPath = path.normalize(videoPath.trim());
@@ -2289,6 +2358,19 @@ router.post('/video', async (req, res) => {
     let dubbedCueCount = 0;
     let droppedDubCount = 0;
 
+    const trackHelperProc = (p) => {
+      if (activeExportState.jobId === myJobId) activeExportState.proc = p;
+      if (p) {
+        activeExportState.helperProcs.add(p);
+        const dropHelper = () => {
+          activeExportState.helperProcs.delete(p);
+          if (activeExportState.proc === p) activeExportState.proc = null;
+        };
+        p.once('close', dropHelper);
+        p.once('error', dropHelper);
+      }
+    };
+
     if (shouldMixDub) {
       activeExportState.phase = 'tts';
       activeExportState.statusText = '🎙️ កំពុងពិនិត្យ និងបង្កើតសំឡេង AI Dubbing...';
@@ -2360,15 +2442,7 @@ router.post('/video', async (req, res) => {
           activeExportState.phase = 'audio_mix';
           activeExportState.statusText = `🔊 កំពុងរៀបចំតម្រៀបសំឡេង Dubbing ${clips.length} បន្ទាត់...`;
         }
-        dubMasterWav = await renderDubMasterWav(clips, workDir, (p) => {
-          if (activeExportState.jobId === myJobId) activeExportState.proc = p;
-          if (p) {
-            activeExportState.helperProcs.add(p);
-            const dropHelper = () => activeExportState.helperProcs.delete(p);
-            p.once('close', dropHelper);
-            p.once('error', dropHelper);
-          }
-        }, isMyJobCancelled);
+        dubMasterWav = await renderDubMasterWav(clips, workDir, trackHelperProc, isMyJobCancelled);
       }
     }
 
@@ -2402,18 +2476,7 @@ router.post('/video', async (req, res) => {
       try {
         const upgraded = await audioRouter.isolateVideoBgm(normalizedVideoPath, {
           isCancelled: isMyJobCancelled,
-          onProcess: (p) => {
-            if (activeExportState.jobId === myJobId) activeExportState.proc = p;
-            if (p) {
-              activeExportState.helperProcs.add(p);
-              const dropHelper = () => {
-                activeExportState.helperProcs.delete(p);
-                if (activeExportState.proc === p) activeExportState.proc = null;
-              };
-              p.once('close', dropHelper);
-              p.once('error', dropHelper);
-            }
-          },
+          onProcess: trackHelperProc,
           onProgress: (info) => {
             if (!info || activeExportState.jobId !== myJobId || activeExportState.cancelled) return;
             const frac = Math.min(1, Math.max(0, (Number(info.percent) || 0) / 100));
@@ -2432,6 +2495,21 @@ router.post('/video', async (req, res) => {
           if (activeExportState.jobId === myJobId) activeExportState.cancelled = true;
         } else {
           console.warn('[export] Auto AI BGM separation fallback:', bgmErr.message);
+        }
+      }
+    }
+    if (!isMyJobCancelled() && cachedBgmStems && cachedBgmStems.needsAmbientUpgrade && typeof audioRouter.upgradeExistingBgmWithAmbient === 'function') {
+      try {
+        const ambUpgraded = await audioRouter.upgradeExistingBgmWithAmbient(normalizedVideoPath, {
+          isCancelled: isMyJobCancelled,
+          onProcess: trackHelperProc
+        });
+        if (ambUpgraded && ambUpgraded.bgmPath) cachedBgmStems = ambUpgraded;
+      } catch (ambErr) {
+        if (ambErr && ambErr.cancelled) {
+          if (activeExportState.jobId === myJobId) activeExportState.cancelled = true;
+        } else {
+          console.warn('[export] Ambient stem upgrade skipped:', ambErr.message);
         }
       }
     }
@@ -2455,6 +2533,21 @@ router.post('/video', async (req, res) => {
       (Number(origVolume) || 0) <= 0.005 ||
       isAiStemEngine;
 
+    const audioChannels = mediaInfo.audioChannels || 2;
+    const mightUseSourceBgmDsp = Boolean(
+      mediaInfo.hasAudio &&
+      audioMixMode !== 'original' &&
+      audioMixMode !== 'dub_only' &&
+      !(cachedBgmStems && cachedBgmStems.bgmPath && (dubMasterWav ? canUseIsolatedStemWithOrig : audioMixMode === 'bgm_only'))
+    );
+    let resolvedSourceBgmFilter = typeof audioRouter.buildBgmFilterForChannels === 'function'
+      ? audioRouter.buildBgmFilterForChannels(audioChannels)
+      : audioRouter.BGM_ISOLATION_FILTER;
+    if (mightUseSourceBgmDsp && audioChannels >= 2 && typeof audioRouter.detectNarrowStereoAudio === 'function') {
+      const isNarrowStereo = await audioRouter.detectNarrowStereoAudio(normalizedVideoPath);
+      resolvedSourceBgmFilter = audioRouter.buildBgmFilterForChannels(audioChannels, { narrowStereo: isNarrowStereo });
+    }
+
     const buildResolvedAudioGraph = (hasIsolatedBgmInput) => {
       const resolvedBgVol = Number.isFinite(Number(bgVolume))
         ? Number(bgVolume)
@@ -2468,7 +2561,8 @@ router.post('/video', async (req, res) => {
         bgVolume: resolvedBgVol,
         dubVolume,
         bgmOnPause: bgmOnPause !== false,
-        sourceAudioTransform
+        sourceAudioTransform,
+        sourceBgmFilter: resolvedSourceBgmFilter
       });
     };
 
@@ -2502,7 +2596,7 @@ router.post('/video', async (req, res) => {
           args.push('-i', cachedBgmStems.bgmPath, '-filter_complex_script', fcScript, '-map', '0:v:0', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', audioBitrate, '-movflags', '+faststart');
           appendMetaAndOut(args);
         } else if (mediaInfo.hasAudio && (audioMixMode === 'bgm_only' || rawSourceAudioAf)) {
-          const afStr = [audioMixMode === 'bgm_only' ? audioRouter.BGM_ISOLATION_FILTER : '', rawSourceAudioAf].filter(Boolean).join(',');
+          const afStr = [audioMixMode === 'bgm_only' ? resolvedSourceBgmFilter : '', rawSourceAudioAf].filter(Boolean).join(',');
           args.push('-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'copy', '-af', afStr, '-c:a', 'aac', '-b:a', audioBitrate, '-movflags', '+faststart');
           appendMetaAndOut(args);
         } else {
@@ -2580,7 +2674,7 @@ router.post('/video', async (req, res) => {
           if (mediaInfo.hasAudio) {
             args.push('-map', '0:a:0?');
             if (audioMixMode === 'bgm_only' || rawSourceAudioAf) {
-              const afStr = [audioMixMode === 'bgm_only' ? audioRouter.BGM_ISOLATION_FILTER : '', rawSourceAudioAf].filter(Boolean).join(',');
+              const afStr = [audioMixMode === 'bgm_only' ? resolvedSourceBgmFilter : '', rawSourceAudioAf].filter(Boolean).join(',');
               args.push('-af', afStr, '-c:a', 'aac', '-b:a', audioBitrate);
             } else {
               args.push('-c:a', 'copy');
@@ -2593,7 +2687,7 @@ router.post('/video', async (req, res) => {
           if (mediaInfo.hasAudio) {
             args.push('-map', '0:a:0?');
             if (audioMixMode === 'bgm_only' || rawSourceAudioAf) {
-              const afStr = [audioMixMode === 'bgm_only' ? audioRouter.BGM_ISOLATION_FILTER : '', rawSourceAudioAf].filter(Boolean).join(',');
+              const afStr = [audioMixMode === 'bgm_only' ? resolvedSourceBgmFilter : '', rawSourceAudioAf].filter(Boolean).join(',');
               args.push('-af', afStr, '-c:a', 'aac', '-b:a', audioBitrate);
             } else {
               args.push('-c:a', 'copy');
@@ -2766,8 +2860,8 @@ router.post('/cancel', (req, res) => {
 });
 
 router.get('/default-dir', (req, res) => {
-  const dir = path.resolve(getExportDir());
-  res.json({ success: true, exportDir: dir });
+  const resolved = resolveWritableExportDir('');
+  res.json({ success: true, exportDir: resolved.dir });
 });
 
 router.post('/open-folder', (req, res) => {
@@ -2889,5 +2983,7 @@ router.prepareCueAudioClips = prepareCueAudioClips;
 router.enforceNonOverlappingDubSchedule = enforceNonOverlappingDubSchedule;
 router.renderDubMasterWav = renderDubMasterWav;
 router.cancelActiveExportProcesses = cancelActiveExportProcesses;
+router.probeDirectoryWritable = probeDirectoryWritable;
+router.resolveWritableExportDir = resolveWritableExportDir;
 
 module.exports = router;

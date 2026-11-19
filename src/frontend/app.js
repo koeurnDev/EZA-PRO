@@ -131,18 +131,33 @@
     const AUDIO_MIX_STORAGE_KEY = 'eza_audio_mixer_v1';
     const audioMixerState = {
       origPct: 0,
-      bgmPct: 65,
+      bgmPct: 85,
       dubPct: 100,
       bgmOnPause: true
     };
+    let hasExplicitOrigMixerSetting = false;
 
     function clampNum(val, min, max, fallback) {
       const n = Number(val);
       return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
     }
 
+    function isOrigAudioExplicitlyMuted() {
+      const origPctVal = clampNum(audioMixerState.origPct, 0, 100, 0);
+      if (origPctVal > 0) return false;
+      const modeEl = typeof document !== 'undefined' ? document.getElementById('exportAudioMode') : null;
+      const modeVal = modeEl ? modeEl.value : '';
+      return Boolean(
+        hasExplicitOrigMixerSetting ||
+        (typeof currentIsolatedBgmUrl === 'string' && currentIsolatedBgmUrl) ||
+        modeVal === 'bgm_only' ||
+        modeVal === 'dub_only'
+      );
+    }
+
     function shouldSuppressOrigVocals() {
-      return audioMixerState.origPct <= 0 && (isVocalInvertOn || isDubVoiceEnabled);
+      return (audioMixerState.origPct <= 0 && (isVocalInvertOn || isDubVoiceEnabled)) ||
+        (isVocalInvertOn && audioMixerState.origPct <= 35);
     }
 
     function syncAudioMixerUi() {
@@ -186,7 +201,7 @@
       if (audioMixerState.origPct > 0) {
         modeEl.value = 'mix_custom';
       } else if (audioMixerState.bgmPct > 0) {
-        modeEl.value = isVocalInvertOn ? 'bgm_only' : 'mix_custom';
+        modeEl.value = 'bgm_only';
       } else {
         modeEl.value = 'dub_only';
       }
@@ -209,8 +224,8 @@
       if (typeof ensureAudioCtxResumed === 'function') ensureAudioCtxResumed();
       const safeGain = clampNum(dubGain, 0, 2.2, 1.0);
       audioEl.volume = Math.min(1.0, safeGain);
-      if (safeGain > 1.01) {
-        initWebAudio();
+      const canUseRunningCtx = Boolean(audioCtx && audioCtx.state === 'running');
+      if (safeGain > 1.01 && (canUseRunningCtx || audioEl._dubGainNode)) {
         if (audioCtx && typeof audioCtx.createMediaElementSource === 'function') {
           try {
             if (!audioEl._dubGainNode) {
@@ -227,14 +242,17 @@
         }
       } else if (audioEl._dubGainNode) {
         try {
-          audioEl._dubGainNode.gain.value = 1.0;
+          audioEl._dubGainNode.gain.value = Math.min(1.0, safeGain);
         } catch (_) {}
       }
     }
 
     function setAudioMixerControl(kind, rawValue) {
       ensureAudioCtxResumed();
-      if (kind === 'orig') audioMixerState.origPct = Math.round(clampNum(rawValue, 0, 100, audioMixerState.origPct));
+      if (kind === 'orig') {
+        audioMixerState.origPct = Math.round(clampNum(rawValue, 0, 100, audioMixerState.origPct));
+        hasExplicitOrigMixerSetting = true;
+      }
       else if (kind === 'bgm') audioMixerState.bgmPct = Math.round(clampNum(rawValue, 0, 150, audioMixerState.bgmPct));
       else if (kind === 'dub') audioMixerState.dubPct = Math.round(clampNum(rawValue, 0, 150, audioMixerState.dubPct));
       else if (kind === 'bgmPause') audioMixerState.bgmOnPause = Boolean(rawValue);
@@ -297,6 +315,7 @@
       ai: false
     };
     const _autoUpgradedBgmPaths = new Set();
+    const _autoStartedOrigMuteBgmPaths = new Set();
     let _isIsolatingBgmInFlight = false;
 
     function isAiSeparationEngineClient(engineId) {
@@ -533,6 +552,7 @@
       initWebAudio();
       ensureAudioCtxResumed();
       const quickBgmBtn = document.getElementById('btnQuickBgm');
+      hasExplicitOrigMixerSetting = true;
       if (presetName === 'orig_only') {
         setDubVoiceEnabled(false);
         isVocalInvertOn = false;
@@ -1305,9 +1325,14 @@
         try { bgmAudio.pause(); } catch (_) {}
       }
       const v = document.getElementById('mainVideo');
-      if (v && !isDubVoiceEnabled && !isVocalInvertOn && dubVolumeBeforeDuck !== null) {
-        v.volume = dubVolumeBeforeDuck;
-        dubVolumeBeforeDuck = null;
+      if (v && !isDubVoiceEnabled && !isVocalInvertOn) {
+        if (isOrigAudioExplicitlyMuted()) {
+          v.volume = 0.0;
+          dubVolumeBeforeDuck = null;
+        } else if (dubVolumeBeforeDuck !== null) {
+          v.volume = dubVolumeBeforeDuck;
+          dubVolumeBeforeDuck = null;
+        }
       }
     }
 
@@ -2780,11 +2805,16 @@
     function syncLiveSourceAudioSuppression(v, matchedIdx) {
       if (!v) return;
       if (bgmAudio) bgmAudio.muted = Boolean(v.muted);
+      const origGain = clampNum(audioMixerState.origPct / 100, 0, 1, 0);
+      const bgmGain = clampNum(audioMixerState.bgmPct / 100, 0, 1.5, 0.85);
       if (!isDubVoiceEnabled && !isVocalInvertOn) {
         if (!isBgmOn && bgmAudio && !bgmAudio.paused) {
           try { bgmAudio.pause(); } catch (_) {}
         }
-        if (dubVolumeBeforeDuck !== null) {
+        if (isOrigAudioExplicitlyMuted()) {
+          v.volume = 0.0;
+          dubVolumeBeforeDuck = null;
+        } else if (dubVolumeBeforeDuck !== null) {
           v.volume = dubVolumeBeforeDuck;
           dubVolumeBeforeDuck = null;
         }
@@ -2795,8 +2825,6 @@
         dubVolumeBeforeDuck = v.volume > 0.2 ? v.volume : 1.0;
       }
 
-      const origGain = clampNum(audioMixerState.origPct / 100, 0, 1, 0);
-      const bgmGain = clampNum(audioMixerState.bgmPct / 100, 0, 1.5, 0.85);
       const dubGain = isDubVoiceEnabled ? clampNum(audioMixerState.dubPct / 100, 0, 1.5, 1.0) : 0;
       const bgmOnPause = Boolean(audioMixerState.bgmOnPause);
       const isDubSpeaking = isDubVoiceEnabled && Boolean(currentDubAudio && !currentDubAudio.paused);
@@ -2810,7 +2838,8 @@
       // Only layer isolated BGM stem alongside original audio when origGain === 0 or separated by neural AI (Demucs / UVR audio-separator);
       // ffmpeg_dsp stems carry notch/MP3 priming delay relative to <video>, causing metallic echo if both play together.
       const isAiBgmStem = currentIsolatedBgmEngine === 'demucs' || currentIsolatedBgmEngine === 'audio-separator';
-      const hasUsableStem = Boolean(currentIsolatedBgmUrl && !(bgmAudio && bgmAudio.error));
+      const stemLoadFailed = Boolean(bgmAudio && bgmAudio.error && bgmAudio._assignedSrc === currentIsolatedBgmUrl);
+      const hasUsableStem = Boolean(currentIsolatedBgmUrl && bgmAudio && !stemLoadFailed);
       const canLayerBgmStem = Boolean(
         hasUsableStem &&
         (isVocalInvertOn || bgmOnPause || bgmGain > 0) &&
@@ -2824,14 +2853,15 @@
             bgmAudio.src = currentIsolatedBgmUrl;
             bgmAudio.loop = false;
             bgmAudio._lastSyncSeekAt = 0;
+            bgmAudio._lastPlayRetryAt = 0;
           }
           const targetRate = Number(v.playbackRate) || 1.0;
           if (Math.abs((bgmAudio.playbackRate || 1.0) - targetRate) > 0.02) {
             try { bgmAudio.playbackRate = targetRate; } catch (_) {}
           }
           const stemTargetGain = isSpeakingNow
-            ? (bgmOnPause ? bgmGain * 0.78 : bgmGain * 0.85)
-            : (bgmOnPause ? bgmGain * 1.35 : bgmGain * 0.90);
+            ? (bgmOnPause ? bgmGain * 0.85 : bgmGain * 0.90)
+            : (bgmOnPause ? bgmGain * 1.30 : bgmGain * 0.95);
           applyDubElementGain(bgmAudio, stemTargetGain);
           const nowMs = Date.now();
           if (
@@ -2841,7 +2871,8 @@
             bgmAudio._lastSyncSeekAt = nowMs;
             try { bgmAudio.currentTime = v.currentTime || 0; } catch (_) {}
           }
-          if (bgmAudio.paused) {
+          if (bgmAudio.paused && (!bgmAudio._lastPlayRetryAt || (nowMs - bgmAudio._lastPlayRetryAt) >= 400)) {
+            bgmAudio._lastPlayRetryAt = nowMs;
             bgmAudio.play().catch(() => {});
           }
         } else if (!bgmAudio.paused && (v.paused || bgmGain <= 0 || !isBgmOn)) {
@@ -2854,15 +2885,32 @@
         bgmAudio.pause();
       }
 
-      // No isolated BGM stem yet: apply WebAudio speech-notch filter and keep BGM/SFX audible under Dub speech
-      if (bgmGain > 0 && origGain <= 0 && !audioCtx && typeof v === 'object') {
+      // No usable isolated BGM stem yet: never blast raw <video> dialogue when origGain === 0;
+      // keep <video> muted and trigger AI BGM isolation during playback if BGM is enabled.
+      if (origGain <= 0) {
+        v.volume = 0.0;
+        if (
+          !v.paused &&
+          currentVideoPath &&
+          bgmGain > 0 &&
+          !currentIsolatedBgmUrl &&
+          !_isIsolatingBgmInFlight &&
+          typeof _autoStartedOrigMuteBgmPaths !== 'undefined' &&
+          !_autoStartedOrigMuteBgmPaths.has(currentVideoPath) &&
+          typeof requestBgmIsolationForCurrentVideo === 'function'
+        ) {
+          _autoStartedOrigMuteBgmPaths.add(currentVideoPath);
+          requestBgmIsolationForCurrentVideo({ activateVocalInvert: true, isAutoUpgrade: true });
+        }
+        return;
+      }
+
+      if (bgmGain > 0 && !v.paused && !audioCtx && typeof v === 'object') {
         initWebAudio();
         ensureAudioCtxResumed();
       }
       if (isSpeakingNow) {
-        v.volume = origGain > 0
-          ? Math.max(0.05, origGain * 0.65)
-          : (bgmGain > 0 ? Math.min(1.0, bgmGain * 0.34) : 0.0);
+        v.volume = Math.max(0.05, origGain * 0.65);
       } else if (bgmGain > 0) {
         v.volume = Math.min(1.0, Math.max(origGain, bgmOnPause ? bgmGain * 0.78 : bgmGain * 0.55));
       } else {
@@ -3307,9 +3355,27 @@
     let currentIsolatedVocalsUrl = null;
     let currentIsolatedBgmEngine = '';
 
+    let _audioCtxUnlockBound = false;
     function ensureAudioCtxResumed() {
       if (audioCtx && audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
         audioCtx.resume().catch(() => {});
+        if (!_audioCtxUnlockBound && typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+          _audioCtxUnlockBound = true;
+          const unlock = () => {
+            if (audioCtx && audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
+              audioCtx.resume().catch(() => {});
+            }
+            if (!audioCtx || audioCtx.state === 'running') {
+              _audioCtxUnlockBound = false;
+              if (typeof document.removeEventListener === 'function') {
+                document.removeEventListener('pointerdown', unlock, true);
+                document.removeEventListener('keydown', unlock, true);
+              }
+            }
+          };
+          document.addEventListener('pointerdown', unlock, true);
+          document.addEventListener('keydown', unlock, true);
+        }
       }
     }
 
@@ -3339,6 +3405,9 @@
         currentIsolatedBgmEngine = data.engine || 'ffmpeg_dsp';
         currentIsolatedBgmUrl = resolveBackendUrl(data.bgmUrl);
         currentIsolatedVocalsUrl = data.vocalsUrl ? resolveBackendUrl(data.vocalsUrl) : null;
+        if (bgmAudio) {
+          bgmAudio._assignedSrc = '';
+        }
         const quickBgmBtn = document.getElementById('btnQuickBgm');
         const stemIsAi = isAiSeparationEngineClient(currentIsolatedBgmEngine);
         if (quickBgmBtn) {
@@ -3347,6 +3416,8 @@
             quickBgmBtn.classList.add('active');
           }
         }
+        syncAudioMixModeFromSliders();
+        syncAudioMixerUi();
         if (typeof applyVocalSuppressionState === 'function') {
           applyVocalSuppressionState(shouldSuppressOrigVocals());
         }
@@ -3354,10 +3425,31 @@
         if (v) syncLiveSourceAudioSuppression(v, activeSpeakingCueIdx);
         syncAudioAiStatusUi();
 
-        // Auto-upgrade legacy ffmpeg_dsp stems once per video when local UVR GPU AI is installed
+        // Auto-upgrade legacy ffmpeg_dsp stems once per video when local UVR GPU AI is installed,
+        // or instantly (<1s) blend missing ambient SFX into pre-v2 AI stems without re-running GPU.
         if (!stemIsAi && audioSeparationCapabilities.ai && !_autoUpgradedBgmPaths.has(targetPath)) {
           _autoUpgradedBgmPaths.add(targetPath);
           requestBgmIsolationForCurrentVideo({ activateVocalInvert: isVocalInvertOn, isAutoUpgrade: true });
+        } else if (stemIsAi && data.needsAmbientUpgrade) {
+          fetch(`${BACKEND_URL}/api/audio/upgrade-ambient`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ videoPath: targetPath })
+          }).then(r => (r.ok ? r.json() : null)).then(upData => {
+            if (!upData || !upData.success || !upData.ready || !upData.bgmUrl || targetPath !== currentVideoPath) return;
+            const sep = upData.bgmUrl.includes('?') ? '&' : '?';
+            currentIsolatedBgmUrl = resolveBackendUrl(`${upData.bgmUrl}${sep}v=${upData.ambientVersion || 3}&t=${Date.now()}`);
+            if (bgmAudio) {
+              bgmAudio._assignedSrc = '';
+              try {
+                bgmAudio.src = currentIsolatedBgmUrl;
+                bgmAudio._assignedSrc = currentIsolatedBgmUrl;
+                if (typeof bgmAudio.load === 'function') bgmAudio.load();
+              } catch (_) {}
+            }
+            const vidEl = document.getElementById('mainVideo');
+            if (vidEl) syncLiveSourceAudioSuppression(vidEl, activeSpeakingCueIdx);
+          }).catch(() => {});
         }
         return true;
       } catch (_) {
@@ -3505,10 +3597,20 @@
           }
           if (data && data.success && data.bgmUrl) {
             currentIsolatedBgmEngine = data.engine || 'ffmpeg_dsp';
-            currentIsolatedBgmUrl = resolveBackendUrl(data.bgmUrl);
+            const rawBgmUrl = resolveBackendUrl(data.bgmUrl);
+            if (options.force && rawBgmUrl) {
+              const sep = rawBgmUrl.includes('?') ? '&' : '?';
+              currentIsolatedBgmUrl = `${rawBgmUrl}${sep}v=${data.ambientVersion || 3}&t=${Date.now()}`;
+            } else {
+              currentIsolatedBgmUrl = rawBgmUrl;
+            }
             currentIsolatedVocalsUrl = data.vocalsUrl ? resolveBackendUrl(data.vocalsUrl) : null;
+            if (bgmAudio) {
+              bgmAudio._assignedSrc = '';
+            }
+            syncAudioMixModeFromSliders();
             const v = document.getElementById('mainVideo');
-            if (v && isVocalInvertOn) syncLiveSourceAudioSuppression(v, activeSpeakingCueIdx);
+            if (v && (isVocalInvertOn || audioMixerState.bgmPct > 0)) syncLiveSourceAudioSuppression(v, activeSpeakingCueIdx);
             const usedAi = isAiSeparationEngineClient(currentIsolatedBgmEngine);
             if (statusEl && isVocalInvertOn) {
               statusEl.innerText = usedAi
@@ -6589,6 +6691,7 @@
 
       if (fromPresetChange) {
         const mode = modeEl.value;
+        hasExplicitOrigMixerSetting = true;
         if (mode === 'bgm_only') {
           audioMixerState.origPct = 0;
           if (audioMixerState.bgmPct <= 0) audioMixerState.bgmPct = 65;
@@ -11603,6 +11706,7 @@
               autoGenerateMissingTts: config.generateTts,
               autoFitTiming: snap.autoFitTiming,
               ...snap.audioMixPayload,
+              ensureAiBgm: Boolean(config.isolateBgm || (!snap.ecoCpu && snap.audioMixPayload && snap.audioMixPayload.audioMixMode === 'bgm_only')),
               ttsEngine: config.ttsEngine,
               castMode: config.castMode,
               fixedVoice: config.fixedVoice,
@@ -11627,6 +11731,7 @@
               autoGenerateMissingTts: config.generateTts,
               autoFitTiming: document.getElementById('exportAutoFitCheck')?.checked !== false,
               ...getAudioMixExportPayload(safeVmAudioMode),
+              ensureAiBgm: Boolean(config.isolateBgm || (!isEcoCpuModeActive() && safeVmAudioMode === 'bgm_only')),
               ttsEngine: config.ttsEngine,
               castMode: config.castMode,
               fixedVoice: config.fixedVoice,

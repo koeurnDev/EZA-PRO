@@ -5,6 +5,7 @@
 
 const { app, BrowserWindow, ipcMain, dialog, safeStorage, shell } = require('electron');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
@@ -491,14 +492,53 @@ function createWindow() {
   });
 }
 
+/**
+ * Probe real file creation inside a directory because Windows Controlled Folder Access
+ * lets fs.existsSync / mkdirSync appear OK on pre-existing folders like Videos while
+ * blocking node/ffmpeg file writes with ENOENT or EACCES.
+ */
+function isDirectoryWritable(dirPath) {
+  if (!dirPath || typeof dirPath !== 'string') return false;
+  try {
+    fs.mkdirSync(dirPath, { recursive: true });
+    const probe = path.join(dirPath, `.eza_write_probe_${process.pid}_${Date.now()}.tmp`);
+    fs.writeFileSync(probe, 'ok', 'utf8');
+    fs.unlinkSync(probe);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function resolveDefaultPackagedExportDir(userDataDir) {
+  const candidates = [];
+  if (process.env.EXPORT_DIR) candidates.push(process.env.EXPORT_DIR);
+  try {
+    const videosDir = app.getPath('videos');
+    if (videosDir) candidates.push(path.join(videosDir, 'EZA PRO Exported'));
+  } catch (_) { }
+  try {
+    const downloadsDir = app.getPath('downloads');
+    if (downloadsDir) candidates.push(path.join(downloadsDir, 'EZA PRO Exported'));
+  } catch (_) { }
+  candidates.push(path.join(userDataDir, 'Exported'));
+  candidates.push(path.join(os.tmpdir(), 'EZA PRO Exported'));
+
+  for (const dir of candidates) {
+    if (isDirectoryWritable(dir)) {
+      if (candidates[0] && dir !== candidates[0]) {
+        logger.logWarn('Main:paths', `Default export folder not writable (${candidates[0]}), using fallback: ${dir}`);
+      }
+      return dir;
+    }
+  }
+  return path.join(userDataDir, 'Exported');
+}
+
 function configurePackagedPaths() {
   process.env.EZA_PACKAGED = app.isPackaged ? '1' : '0';
   if (!app.isPackaged) return;
   const userDataDir = app.getPath('userData');
-  let videosBaseDir = userDataDir;
-  try {
-    videosBaseDir = app.getPath('videos') || userDataDir;
-  } catch (_) { }
 
   process.env.EZA_PACKAGED_CLIENT = '1';
   delete process.env.GEMINI_API_KEY;
@@ -517,7 +557,7 @@ function configurePackagedPaths() {
   process.env.AUDIO_SEPARATOR_MODEL_DIR = process.env.AUDIO_SEPARATOR_MODEL_DIR || path.join(userDataDir, 'ai_models', 'audio_separator');
   process.env.TORCH_HOME = process.env.TORCH_HOME || path.join(userDataDir, 'ai_models', 'torch');
   process.env.SENSEVOICE_CACHE_DIR = process.env.SENSEVOICE_CACHE_DIR || path.join(userDataDir, 'ai_models', 'sensevoice');
-  process.env.EXPORT_DIR = process.env.EXPORT_DIR || path.join(videosBaseDir, 'EZA PRO Exported');
+  process.env.EXPORT_DIR = resolveDefaultPackagedExportDir(userDataDir);
 }
 
 function ensureWindowsKhmerFontInstalled() {

@@ -10540,6 +10540,220 @@ test('Bug audit regressions: missing Hub handlers, startup ecoCpu restore, 403 c
   assert.match(mainJs, /Skipping legacy key migration when accounts unavailable/, 'migrateLegacyGeminiKey must guard loadGeminiAccounts');
 });
 
+test('BGM + DUB root-cause regressions: dual-mono DSP protection, writable export fallback, model/venv discovery, and preview AudioContext guard', async () => {
+  const vm = require('node:vm');
+  const appJs = fs.readFileSync(path.join(__dirname, 'src', 'frontend', 'app.js'), 'utf8');
+  const mainJs = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+
+  // 1. Dual-mono stereo fixture (L == R): detectNarrowStereoAudio identifies narrow stereo & buildBgmFilterForChannels preserves volume
+  const dualMonoVid = path.join(tempRoot, 'dual-mono-stereo.mp4');
+  const gen = spawnSync(FFMPEG_BIN, [
+    '-y', '-f', 'lavfi', '-i', 'color=c=black:s=160x160:d=1.2:r=24',
+    '-f', 'lavfi', '-i', 'aevalsrc=0.4*sin(2*PI*220*t)|0.4*sin(2*PI*220*t):d=1.2:s=44100',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
+    dualMonoVid
+  ], { encoding: 'utf8' });
+  assert.equal(gen.status, 0, gen.stderr);
+
+  const isNarrow = await audioModule.detectNarrowStereoAudio(dualMonoVid);
+  assert.equal(isNarrow, true, 'Identical L/R 2ch stereo must be detected as narrowStereo');
+  const safeFilter = audioModule.buildBgmFilterForChannels(2, { narrowStereo: true });
+  assert.ok(!safeFilter.includes('stereotools'), 'Narrow stereo must avoid center-canceling stereotools');
+  const normalStereoFilter = audioModule.buildBgmFilterForChannels(2);
+  assert.ok(normalStereoFilter.includes('stereotools'), 'Standard stereo default filter retains stereotools');
+
+  // Verify ffmpeg_dsp isolation on dual-mono preserves audible signal instead of -45dB silence
+  const prevBgmDir = process.env.BGM_CACHE_DIR;
+  process.env.BGM_CACHE_DIR = path.join(tempRoot, 'bgm_narrow_test');
+  try {
+    const res = await audioModule.isolateVideoBgm(dualMonoVid, { engine: 'ffmpeg_dsp', force: true });
+    const vd = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', res.bgmPath, '-af', 'volumedetect', '-f', 'null', 'NUL'], { encoding: 'utf8' });
+    const meanM = (vd.stderr || '').match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+    assert.ok(meanM && parseFloat(meanM[1]) > -30, `Expected audible BGM > -30 dB on dual-mono video, got ${meanM && meanM[1]} dB`);
+  } finally {
+    if (prevBgmDir === undefined) delete process.env.BGM_CACHE_DIR;
+    else process.env.BGM_CACHE_DIR = prevBgmDir;
+  }
+
+  // 2. getAiModelsDir prefers existing directory with model weights over an empty override
+  const emptyOverrideModelDir = path.join(tempRoot, 'empty_override_models');
+  const prevModelOverride = process.env.AUDIO_SEPARATOR_MODEL_DIR;
+  fs.mkdirSync(emptyOverrideModelDir, { recursive: true });
+  process.env.AUDIO_SEPARATOR_MODEL_DIR = emptyOverrideModelDir;
+  try {
+    const resolvedModelDir = audioModule.getAiModelsDir();
+    const projectModels = path.join(__dirname, '.ai_models', 'audio_separator');
+    if (fs.existsSync(projectModels) && fs.readdirSync(projectModels).some(f => /\.(onnx|ckpt|pth|safetensors)$/i.test(f))) {
+      assert.equal(path.normalize(resolvedModelDir).toLowerCase(), path.normalize(projectModels).toLowerCase());
+    }
+  } finally {
+    if (prevModelOverride === undefined) delete process.env.AUDIO_SEPARATOR_MODEL_DIR;
+    else process.env.AUDIO_SEPARATOR_MODEL_DIR = prevModelOverride;
+  }
+
+  // 3. Export writability fallback & fast fail on blocked custom outputDir
+  assert.match(mainJs, /resolveDefaultPackagedExportDir/, 'main.js must probe packaged default export folder writability');
+  const prevExportDir = process.env.EXPORT_DIR;
+  const badDefaultDir = path.join(tempRoot, 'file_blocking_dir');
+  fs.writeFileSync(badDefaultDir, 'not a dir', 'utf8');
+  process.env.EXPORT_DIR = badDefaultDir;
+  try {
+    const resolvedDefault = exportModule.resolveWritableExportDir('');
+    assert.equal(resolvedDefault.writable, true);
+    assert.equal(resolvedDefault.isFallback, true);
+    assert.notEqual(path.normalize(resolvedDefault.dir), path.normalize(badDefaultDir));
+  } finally {
+    if (prevExportDir === undefined) delete process.env.EXPORT_DIR;
+    else process.env.EXPORT_DIR = prevExportDir;
+  }
+
+  const { server, baseUrl } = await startTestServer();
+  try {
+    const blockedRes = await fetch(`${baseUrl}/api/export/video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        videoPath: dualMonoVid,
+        cues: [{ startSec: 0, endSec: 1, text: '你好', translated: 'សួស្តី' }],
+        outputDir: badDefaultDir
+      })
+    });
+    assert.equal(blockedRes.status, 403);
+    const blockedJson = await blockedRes.json();
+    assert.match(blockedJson.error, /Controlled Folder Access|Folder/);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+
+  // 4. Frontend keeps bgm_only on startup and avoids creating MediaElementSource into suspended AudioContext
+  const modeSelect = { value: 'bgm_only' };
+  let createSrcCount = 0;
+  const suspendedCtx = {
+    state: 'suspended',
+    resume: () => Promise.resolve(),
+    createMediaElementSource: () => { createSrcCount += 1; return { connect() {} }; },
+    createGain: () => ({ gain: { value: 1 }, connect() {} }),
+    createBiquadFilter: () => ({ frequency: { value: 0 }, Q: { value: 1 }, gain: { value: 0 }, connect() {} }),
+    destination: {}
+  };
+  const els = {
+    exportAudioMode: modeSelect,
+    mainVideo: { paused: true, muted: false, volume: 1.0, currentTime: 0, playbackRate: 1.0 }
+  };
+  const sbox = {
+    console, Math, Date, Number, String, Boolean, Array, Object, JSON, RegExp, Promise, Map, Set,
+    URLSearchParams, setTimeout, clearTimeout, setInterval, clearInterval,
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    Audio: function () { return { pause() {}, play: () => Promise.resolve(), addEventListener() {}, src: '', volume: 1 }; },
+    AudioContext: function () { return suspendedCtx; },
+    fetch: () => Promise.resolve({ ok: true, status: 200, json: async () => ({}) }),
+    document: { getElementById: id => els[id] || null, querySelectorAll: () => [], addEventListener() {}, removeEventListener() {} }
+  };
+  sbox.window = sbox;
+  sbox.addEventListener = () => {};
+  sbox.location = { protocol: 'http:', origin: 'http://localhost:3001', href: 'http://localhost:3001/' };
+  const fctx = vm.createContext(sbox);
+  vm.runInContext(appJs, fctx);
+  assert.equal(modeSelect.value, 'bgm_only', 'Startup loadSavedAudioMixerState must preserve bgm_only mode');
+  assert.equal(vm.runInContext('audioMixerState.bgmPct', fctx), 85, 'Default BGM slider level should align with 85% UI');
+  vm.runInContext(`isVocalInvertOn = true; audioMixerState.origPct = 25;`, fctx);
+  assert.equal(vm.runInContext('shouldSuppressOrigVocals()', fctx), true, 'Movie+Dub 25% preset must retain vocal notch suppression when BGM isolate is active');
+  vm.runInContext(`audioCtx = new AudioContext(); applyDubElementGain({ volume: 1 }, 1.25);`, fctx);
+  assert.equal(createSrcCount, 0, 'Must not trap <audio> inside a suspended AudioContext');
+  assert.match(appJs, /ensureAiBgm:\s*Boolean\(config\.isolateBgm/, 'Video Manager batch must propagate ensureAiBgm for bgm_only');
+
+  // 4b. When origPct === 0, live preview must keep <video> muted (even without stem or with Dub+BGM toggled off)
+  vm.runInContext(`
+    isDubVoiceEnabled = true;
+    isVocalInvertOn = true;
+    currentIsolatedBgmUrl = null;
+    Object.assign(audioMixerState, { origPct: 0, bgmPct: 85, dubPct: 100, bgmOnPause: true });
+    const mv1 = document.getElementById('mainVideo');
+    mv1.paused = false;
+    mv1.volume = 0.9;
+    syncLiveSourceAudioSuppression(mv1, -1);
+  `, fctx);
+  assert.equal(els.mainVideo.volume, 0, 'origPct=0 without ready stem must keep raw <video> dialogue muted');
+
+  vm.runInContext(`
+    isDubVoiceEnabled = false;
+    isVocalInvertOn = false;
+    const mv2 = document.getElementById('mainVideo');
+    mv2.volume = 0.8;
+    syncLiveSourceAudioSuppression(mv2, -1);
+  `, fctx);
+  assert.equal(els.mainVideo.volume, 0, 'origPct=0 in bgm_only mode must keep raw <video> muted even when Dub & BGM buttons are toggled off');
+
+  // 5. Ambient SFX v3 recovery blends non-speech impacts while ducking active speech core to prevent dialogue leaks
+  const ambTestDir = path.join(tempRoot, 'bgm_ambient_upgrade_test');
+  fs.mkdirSync(ambTestDir, { recursive: true });
+  const prevAmbBgmDir = process.env.BGM_CACHE_DIR;
+  process.env.BGM_CACHE_DIR = ambTestDir;
+  try {
+    const srcVid = path.join(tempRoot, 'ambient-sfx-src.mp4');
+    const genSrc = spawnSync(FFMPEG_BIN, [
+      '-y', '-f', 'lavfi', '-i', 'color=c=black:s=160x160:d=1.2:r=24',
+      '-f', 'lavfi', '-i', 'sine=f=120:d=1.2',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
+      srcVid
+    ], { encoding: 'utf8' });
+    assert.equal(genSrc.status, 0, genSrc.stderr);
+    const cacheKey = audioModule.getBgmCacheKey(srcVid);
+    const quietBgm = path.join(ambTestDir, `${cacheKey}_bgm.mp3`);
+    const impactVoc = path.join(ambTestDir, `${cacheKey}_vocals.mp3`);
+    const metaJson = path.join(ambTestDir, `${cacheKey}_meta.json`);
+    spawnSync(FFMPEG_BIN, ['-y', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', '1.2', '-c:a', 'libmp3lame', quietBgm]);
+    spawnSync(FFMPEG_BIN, ['-y', '-f', 'lavfi', '-i', 'aevalsrc=0.45*sin(2*PI*110*t)|0.45*sin(2*PI*110*t):d=1.2:s=44100', '-c:a', 'libmp3lame', impactVoc]);
+    fs.writeFileSync(metaJson, JSON.stringify({ engine: 'audio-separator', videoPath: srcVid, createdAt: new Date().toISOString() }), 'utf8');
+
+    const beforeSt = audioModule.getCachedStemsForVideo(srcVid);
+    assert.equal(beforeSt.needsAmbientUpgrade, true);
+    const upSt = await audioModule.upgradeExistingBgmWithAmbient(srcVid);
+    assert.equal(upSt.needsAmbientUpgrade, false);
+    assert.equal(upSt.ambientVersion, 3);
+    assert.ok(upSt.hasRawBgm && upSt.rawBgmPath && fs.existsSync(upSt.rawBgmPath), 'Upgraded AI BGM must preserve _bgm_raw.mp3 backup');
+    const vdUp = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', upSt.bgmPath, '-af', 'volumedetect', '-f', 'null', 'NUL'], { encoding: 'utf8' });
+    const meanUp = (vdUp.stderr || '').match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+    assert.ok(meanUp && parseFloat(meanUp[1]) > -25, `Expected recovered ambient sub-bass > -25 dB in upgraded BGM, got ${meanUp && meanUp[1]} dB`);
+
+    // Verify vocal-core sidechain gate ducks pitch F0 / sibilants during active dialogue (prevents dialogue leak)
+    const leakTestDir = path.join(tempRoot, 'bgm_ambient_speech_gate_test');
+    fs.mkdirSync(leakTestDir, { recursive: true });
+    const silenceBgm = path.join(leakTestDir, 'silence_bgm.mp3');
+    const speechVoc = path.join(leakTestDir, 'speech_vocals.mp3');
+    const gatedOut = path.join(leakTestDir, 'gated_out.mp3');
+    spawnSync(FFMPEG_BIN, ['-y', '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', '1.5', '-c:a', 'libmp3lame', silenceBgm]);
+    // Mix 180Hz vocal F0 + 850Hz speech formant + 5500Hz fricative
+    spawnSync(FFMPEG_BIN, [
+      '-y', '-f', 'lavfi',
+      '-i', 'aevalsrc=(0.25*sin(2*PI*180*t)+0.45*sin(2*PI*850*t)+0.20*sin(2*PI*5500*t))|(0.25*sin(2*PI*180*t)+0.45*sin(2*PI*850*t)+0.20*sin(2*PI*5500*t)):d=1.5:s=44100',
+      '-c:a', 'libmp3lame', speechVoc
+    ]);
+    await audioModule.blendAmbientSfxIntoBgm(silenceBgm, speechVoc, gatedOut);
+    const vdLeak = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', gatedOut, '-af', 'volumedetect', '-f', 'null', 'NUL'], { encoding: 'utf8' });
+    const meanLeak = (vdLeak.stderr || '').match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+    assert.ok(meanLeak && parseFloat(meanLeak[1]) < -38, `Expected speech-gated ambient stem < -38 dB during active vocals, got ${meanLeak && meanLeak[1]} dB`);
+
+    // Legacy v2 cache without raw backup must flag needsCleanReseparate
+    const v2Vid = path.join(tempRoot, 'legacy-v2-polluted.mp4');
+    fs.copyFileSync(srcVid, v2Vid);
+    const v2Key = audioModule.getBgmCacheKey(v2Vid);
+    fs.copyFileSync(quietBgm, path.join(ambTestDir, `${v2Key}_bgm.mp3`));
+    fs.copyFileSync(impactVoc, path.join(ambTestDir, `${v2Key}_vocals.mp3`));
+    fs.writeFileSync(path.join(ambTestDir, `${v2Key}_meta.json`), JSON.stringify({
+      engine: 'audio-separator',
+      ambientVersion: 2,
+      videoPath: v2Vid
+    }), 'utf8');
+    const v2State = audioModule.getCachedStemsForVideo(v2Vid);
+    assert.equal(v2State.needsCleanReseparate, true);
+    assert.equal(v2State.needsAmbientUpgrade, true);
+  } finally {
+    if (prevAmbBgmDir === undefined) delete process.env.BGM_CACHE_DIR;
+    else process.env.BGM_CACHE_DIR = prevAmbBgmDir;
+  }
+});
+
 
 
 

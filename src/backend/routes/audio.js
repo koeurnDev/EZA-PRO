@@ -44,14 +44,107 @@ function getProjectRoot() {
   return path.resolve(__dirname, '..', '..', '..');
 }
 
+function getExternalBaseRoots() {
+  const candidates = [
+    getProjectRoot(),
+    process.cwd(),
+    process.env.EZA_USER_DATA_DIR,
+    process.env.PORTABLE_EXECUTABLE_DIR,
+    process.env.PORTABLE_EXECUTABLE_DIR ? path.dirname(process.env.PORTABLE_EXECUTABLE_DIR) : '',
+    process.resourcesPath ? path.dirname(process.resourcesPath) : '',
+    process.resourcesPath ? path.dirname(path.dirname(process.resourcesPath)) : '',
+    process.execPath ? path.dirname(process.execPath) : '',
+    process.execPath ? path.dirname(path.dirname(process.execPath)) : '',
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'EZA PRO') : '',
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'EZA PRO') : ''
+  ].filter(Boolean);
+
+  const seen = new Set();
+  const out = [];
+  for (const dir of candidates) {
+    try {
+      const norm = path.normalize(dir);
+      const key = process.platform === 'win32' ? norm.toLowerCase() : norm;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(norm);
+    } catch (_) { }
+  }
+  return out;
+}
+
+function getVenvAudioDirs() {
+  const seen = new Set();
+  const dirs = [];
+  const pushIfExists = (dir) => {
+    if (!dir) return;
+    try {
+      const norm = path.normalize(dir);
+      const key = process.platform === 'win32' ? norm.toLowerCase() : norm;
+      if (seen.has(key)) return;
+      seen.add(key);
+      if (fs.existsSync(norm)) dirs.push(norm);
+    } catch (_) { }
+  };
+  pushIfExists(process.env.EZA_AUDIO_VENV_DIR);
+  for (const base of getExternalBaseRoots()) {
+    pushIfExists(path.join(base, '.venv_audio'));
+  }
+  return dirs;
+}
+
+function getPythonScriptsBinaryCandidates(binName) {
+  if (process.platform !== 'win32') return [];
+  const out = [];
+  const roots = [
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Python') : '',
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'Python') : ''
+  ].filter(Boolean);
+  for (const pyRoot of roots) {
+    try {
+      if (!fs.existsSync(pyRoot)) continue;
+      for (const entry of fs.readdirSync(pyRoot)) {
+        const candidate = path.join(pyRoot, entry, 'Scripts', binName);
+        if (fs.existsSync(candidate)) out.push(candidate);
+      }
+    } catch (_) { }
+  }
+  return out;
+}
+
+function dirHasModelWeights(dirPath) {
+  try {
+    if (!dirPath || !fs.existsSync(dirPath)) return false;
+    return fs.readdirSync(dirPath).some(f => /\.(onnx|ckpt|pth|safetensors)$/i.test(f));
+  } catch (_) {
+    return false;
+  }
+}
+
 function getAiModelsDir() {
   const candidates = [
-    process.env.AUDIO_SEPARATOR_MODEL_DIR,
-    process.env.EZA_USER_DATA_DIR ? path.join(process.env.EZA_USER_DATA_DIR, 'ai_models', 'audio_separator') : '',
-    path.join(getProjectRoot(), '.ai_models', 'audio_separator'),
-    path.join(os.tmpdir(), 'eza-pro-ai-models', 'audio_separator')
-  ].filter(Boolean);
-  for (const dir of candidates) {
+    process.env.AUDIO_SEPARATOR_MODEL_DIR
+  ];
+  for (const base of getExternalBaseRoots()) {
+    candidates.push(path.join(base, '.ai_models', 'audio_separator'));
+    candidates.push(path.join(base, 'ai_models', 'audio_separator'));
+  }
+  candidates.push(path.join(os.tmpdir(), 'eza-pro-ai-models', 'audio_separator'));
+
+  const seen = new Set();
+  const unique = [];
+  for (const dir of candidates.filter(Boolean)) {
+    const norm = path.normalize(dir);
+    const key = process.platform === 'win32' ? norm.toLowerCase() : norm;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(norm);
+  }
+
+  for (const dir of unique) {
+    if (dirHasModelWeights(dir)) return dir;
+  }
+  for (const dir of unique) {
     try {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -83,6 +176,42 @@ const BGM_ISOLATION_FILTER = [
   'afftdn=nf=-25',
   'alimiter=limit=0.95'
 ].join(',');
+
+/**
+ * Mono-safe / dual-mono-safe vocal notch EQ + adaptive loudness normalization so mono or
+ * narrow-stereo drama audio retains audible music/ambience instead of getting silenced.
+ */
+const MONO_SAFE_BGM_FILTER = [
+  'aresample=44100',
+  'aformat=sample_fmts=fltp:channel_layouts=stereo',
+  'equalizer=f=380:t=q:w=1.0:g=-10',
+  'equalizer=f=750:t=q:w=1.0:g=-13',
+  'equalizer=f=1400:t=q:w=0.9:g=-15',
+  'equalizer=f=2400:t=q:w=0.9:g=-13',
+  'equalizer=f=3400:t=q:w=1.0:g=-10',
+  'dynaudnorm=f=180:g=11:p=0.85',
+  'alimiter=limit=0.95'
+].join(',');
+
+const AMBIENT_BLEND_VERSION = 3;
+
+/**
+ * Blend dialogue-safe environmental ambience & Foley SFX (<115Hz impacts/footsteps/room body,
+ * >7800Hz crisp clinks/air/water, and wide-stereo L-R ambience) recovered from the vocals stem
+ * back into the AI instrumental stem, gated/ducked cleanly by the mono speech core (300-3400Hz)
+ * so spoken syllables, pitch F0, and sibilants never leak when original voice is muted.
+ */
+const AMBIENT_SFX_BLEND_FILTER = [
+  '[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,asplit=4[l][h][w][det_in]',
+  '[det_in]pan=mono|c0=0.5*c0+0.5*c1,highpass=f=300,highpass=f=300,highpass=f=300,lowpass=f=3400,lowpass=f=3400,volume=3.5[sc_voc]',
+  '[l]lowpass=f=115,lowpass=f=115,volume=0.85[lo]',
+  '[h]highpass=f=7800,highpass=f=7800,volume=0.65[hi]',
+  '[w]pan=stereo|c0=0.5*c0-0.5*c1|c1=0.5*c1-0.5*c0,highpass=f=300,lowpass=f=3500,volume=0.75[side]',
+  '[lo][hi][side]amix=inputs=3:normalize=0,alimiter=limit=0.85[amb_raw]',
+  '[amb_raw][sc_voc]sidechaincompress=threshold=0.015:ratio=20:attack=4:release=450:makeup=1[amb]',
+  '[0:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[bg]',
+  '[bg][amb]amix=inputs=2:normalize=0:dropout_transition=0,alimiter=limit=0.95[out]'
+].join(';');
 
 /**
  * Center-channel dialogue booster + speech bandpass filter for clean voice extraction.
@@ -143,29 +272,40 @@ function getBgmCacheKey(videoPath) {
 /**
  * Build child process environment with bundled FFmpeg and CUDA/cuDNN DLL paths on Windows.
  */
-function buildChildProcessEnv(extraVars = {}) {
-  const root = getProjectRoot();
+function buildChildProcessEnv(extraVars = {}, preferredVenvRoot = null) {
   const pathEntries = [];
+  const pathSeen = new Set();
+  const pushPath = (p) => {
+    if (!p) return;
+    try {
+      const norm = path.normalize(p);
+      const key = process.platform === 'win32' ? norm.toLowerCase() : norm;
+      if (pathSeen.has(key) || !fs.existsSync(norm)) return;
+      pathSeen.add(key);
+      pathEntries.push(norm);
+    } catch (_) { }
+  };
+
   if (FFMPEG_BIN && FFMPEG_BIN !== 'ffmpeg') {
-    const ffmpegDir = path.dirname(FFMPEG_BIN);
-    if (fs.existsSync(ffmpegDir)) pathEntries.push(ffmpegDir);
+    pushPath(path.dirname(FFMPEG_BIN));
   }
 
-  const venvRoot = path.join(root, '.venv_audio');
-  const scriptsDir = path.join(venvRoot, process.platform === 'win32' ? 'Scripts' : 'bin');
-  if (fs.existsSync(scriptsDir)) pathEntries.push(scriptsDir);
-
-  if (process.platform === 'win32') {
-    const torchLibDir = path.join(venvRoot, 'Lib', 'site-packages', 'torch', 'lib');
-    if (fs.existsSync(torchLibDir)) pathEntries.push(torchLibDir);
-    const nvidiaBase = path.join(venvRoot, 'Lib', 'site-packages', 'nvidia');
-    if (fs.existsSync(nvidiaBase)) {
-      try {
-        for (const pkg of fs.readdirSync(nvidiaBase)) {
-          const binDir = path.join(nvidiaBase, pkg, 'bin');
-          if (fs.existsSync(binDir)) pathEntries.push(binDir);
-        }
-      } catch (_) {}
+  const venvRoots = [
+    preferredVenvRoot,
+    ...getVenvAudioDirs()
+  ].filter(Boolean);
+  for (const venvRoot of venvRoots) {
+    pushPath(path.join(venvRoot, process.platform === 'win32' ? 'Scripts' : 'bin'));
+    if (process.platform === 'win32') {
+      pushPath(path.join(venvRoot, 'Lib', 'site-packages', 'torch', 'lib'));
+      const nvidiaBase = path.join(venvRoot, 'Lib', 'site-packages', 'nvidia');
+      if (fs.existsSync(nvidiaBase)) {
+        try {
+          for (const pkg of fs.readdirSync(nvidiaBase)) {
+            pushPath(path.join(nvidiaBase, pkg, 'bin'));
+          }
+        } catch (_) {}
+      }
     }
   }
 
@@ -174,19 +314,31 @@ function buildChildProcessEnv(extraVars = {}) {
     ? `${pathEntries.join(path.delimiter)}${existingPath ? path.delimiter + existingPath : ''}`
     : existingPath;
 
-  const torchCandidates = [
-    process.env.TORCH_HOME,
-    process.env.EZA_USER_DATA_DIR ? path.join(process.env.EZA_USER_DATA_DIR, 'ai_models', 'torch') : '',
-    path.join(root, '.ai_models', 'torch'),
-    path.join(os.tmpdir(), 'eza-pro-torch-cache')
-  ].filter(Boolean);
+  const torchCandidates = [process.env.TORCH_HOME];
+  for (const base of getExternalBaseRoots()) {
+    torchCandidates.push(path.join(base, '.ai_models', 'torch'));
+    torchCandidates.push(path.join(base, 'ai_models', 'torch'));
+  }
+  torchCandidates.push(path.join(os.tmpdir(), 'eza-pro-torch-cache'));
+
   let torchHome = os.tmpdir();
-  for (const dir of torchCandidates) {
+  for (const dir of torchCandidates.filter(Boolean)) {
     try {
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      torchHome = dir;
-      break;
+      const hubDir = path.join(dir, 'hub');
+      if (fs.existsSync(hubDir) && fs.readdirSync(hubDir).length > 0) {
+        torchHome = dir;
+        break;
+      }
     } catch (_) {}
+  }
+  if (torchHome === os.tmpdir()) {
+    for (const dir of torchCandidates.filter(Boolean)) {
+      try {
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        torchHome = dir;
+        break;
+      } catch (_) {}
+    }
   }
 
   const isLowRamHost = Number(os.totalmem() || 0) > 0 && Number(os.totalmem()) <= 8.5 * 1024 * 1024 * 1024;
@@ -211,25 +363,28 @@ function detectSeparationEngine(forceRefresh = false) {
     }
   }
 
-  const root = getProjectRoot();
-  const venvSepBin = path.join(
-    root,
-    '.venv_audio',
-    process.platform === 'win32' ? 'Scripts' : 'bin',
-    process.platform === 'win32' ? 'audio-separator.exe' : 'audio-separator'
-  );
+  const sepBinName = process.platform === 'win32' ? 'audio-separator.exe' : 'audio-separator';
+  const pyBinName = process.platform === 'win32' ? 'python.exe' : 'python';
+  const subDir = process.platform === 'win32' ? 'Scripts' : 'bin';
+  const venvDirs = getVenvAudioDirs();
   const sepCandidates = [];
   if (process.env.AUDIO_SEPARATOR_BIN) {
-    sepCandidates.push([process.env.AUDIO_SEPARATOR_BIN, []]);
+    sepCandidates.push([process.env.AUDIO_SEPARATOR_BIN, [], null]);
   }
-  if (fs.existsSync(venvSepBin)) {
-    sepCandidates.push([venvSepBin, []]);
+  for (const venvDir of venvDirs) {
+    const candidate = path.join(venvDir, subDir, sepBinName);
+    if (fs.existsSync(candidate)) {
+      sepCandidates.push([candidate, [], venvDir]);
+    }
   }
-  sepCandidates.push(['audio-separator', []]);
+  for (const pyScriptSep of getPythonScriptsBinaryCandidates(sepBinName)) {
+    sepCandidates.push([pyScriptSep, [], path.dirname(path.dirname(pyScriptSep))]);
+  }
+  sepCandidates.push(['audio-separator', [], null]);
 
-  const childEnv = buildChildProcessEnv();
-  for (const [cmd, prefix] of sepCandidates) {
+  for (const [cmd, prefix, venvRoot] of sepCandidates) {
     try {
+      const childEnv = buildChildProcessEnv({}, venvRoot);
       const uvr = spawnSync(cmd, [...prefix, '--version'], {
         encoding: 'utf8',
         windowsHide: true,
@@ -241,6 +396,7 @@ function detectSeparationEngine(forceRefresh = false) {
           id: 'audio-separator',
           cmd,
           argsPrefix: prefix,
+          venvRoot,
           model: DEFAULT_AUDIO_SEPARATOR_MODEL,
           label: `UVR MDX-Net AI (${DEFAULT_AUDIO_SEPARATOR_MODEL.replace(/\.(onnx|ckpt|pth)$/i, '')})`,
           ai: true
@@ -250,20 +406,18 @@ function detectSeparationEngine(forceRefresh = false) {
     } catch (_) {}
   }
 
-  const venvPy = path.join(
-    root,
-    '.venv_audio',
-    process.platform === 'win32' ? 'Scripts' : 'bin',
-    process.platform === 'win32' ? 'python.exe' : 'python'
-  );
   const demucsCandidates = [];
-  if (fs.existsSync(venvPy)) {
-    demucsCandidates.push([venvPy, ['-m', 'demucs']]);
+  for (const venvDir of venvDirs) {
+    const venvPy = path.join(venvDir, subDir, pyBinName);
+    if (fs.existsSync(venvPy)) {
+      demucsCandidates.push([venvPy, ['-m', 'demucs'], venvDir]);
+    }
   }
-  demucsCandidates.push(['demucs', []], ['py', ['-m', 'demucs']], ['python', ['-m', 'demucs']]);
+  demucsCandidates.push(['demucs', [], null], ['py', ['-m', 'demucs'], null], ['python', ['-m', 'demucs'], null]);
 
-  for (const [cmd, prefix] of demucsCandidates) {
+  for (const [cmd, prefix, venvRoot] of demucsCandidates) {
     try {
+      const childEnv = buildChildProcessEnv({}, venvRoot);
       const check = spawnSync(cmd, [...prefix, '--help'], {
         encoding: 'utf8',
         windowsHide: true,
@@ -292,11 +446,57 @@ function detectSeparationEngine(forceRefresh = false) {
   return cachedSeparationEngine;
 }
 
-function buildBgmFilterForChannels(channels = 2) {
-  if (channels === 1) {
-    return BGM_ISOLATION_FILTER.replace(',stereotools=mlev=0.04:slev=1.25', '');
+function buildBgmFilterForChannels(channels = 2, options = {}) {
+  if (channels <= 1 || (options && options.narrowStereo)) {
+    return MONO_SAFE_BGM_FILTER;
   }
   return BGM_ISOLATION_FILTER;
+}
+
+/**
+ * Detect dual-mono or narrow-stereo tracks (common in Chinese vertical drama MP4s)
+ * where Side (L-R) energy is minimal so stereotools center-cancel would silence BGM.
+ */
+function measureMeanVolumeDb(filePath, afFilter = 'volumedetect', sampleSec = 15) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const args = ['-nostdin', '-hide_banner', '-t', String(sampleSec), '-i', filePath, '-vn', '-af', afFilter, '-f', 'null', '-'];
+    const proc = spawn(FFMPEG_BIN, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch (_) { try { proc.kill(); } catch (_) {} }
+      finish(null);
+    }, 8000);
+    proc.stderr.on('data', d => {
+      if (stderr.length < 32768) stderr += d.toString();
+    });
+    proc.on('error', () => finish(null));
+    proc.on('close', () => {
+      const m = stderr.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/);
+      finish(m ? parseFloat(m[1]) : null);
+    });
+  });
+}
+
+function detectNarrowStereoAudio(filePath) {
+  if (!filePath || typeof filePath !== 'string') return Promise.resolve(false);
+  return Promise.all([
+    measureMeanVolumeDb(filePath, 'volumedetect', 15),
+    measureMeanVolumeDb(filePath, 'pan=mono|c0=0.5*c0-0.5*c1,volumedetect', 15)
+  ]).then(([totalMean, sideMean]) => {
+    if (Number.isFinite(totalMean) && Number.isFinite(sideMean)) {
+      if ((totalMean - sideMean) >= 14 || sideMean <= -38) {
+        return true;
+      }
+    }
+    return false;
+  }).catch(() => false);
 }
 
 function buildVocalFilterForChannels(channels = 2) {
@@ -666,6 +866,22 @@ async function concatWavListToMp3(wavPaths, outMp3Path, bitrate, listPath, hooks
   }
 }
 
+async function blendAmbientSfxIntoBgm(rawBgmPath, vocalsPath, finalBgmOutPath, hooks = {}) {
+  await runFfmpegCommand([
+    '-y',
+    '-i', rawBgmPath,
+    '-i', vocalsPath,
+    '-filter_complex', AMBIENT_SFX_BLEND_FILTER,
+    '-map', '[out]',
+    '-c:a', 'libmp3lame',
+    '-b:a', '192k',
+    finalBgmOutPath
+  ], 'FFmpeg blend ambient SFX', 10 * 60 * 1000, hooks);
+  if (!isValidAudioFile(finalBgmOutPath)) {
+    throw new Error(`Ambient-blended BGM MP3 is invalid: ${finalBgmOutPath}`);
+  }
+}
+
 /**
  * Run UVR audio-separator with FFmpeg WAV normalization, single-process multi-chunk batching,
  * resumable chunk checkpoints, and live chunk progress reporting.
@@ -681,7 +897,7 @@ async function runAudioSeparatorSeparation(videoPath, bgmOutPath, vocalsOutPath,
   fs.mkdirSync(tempDir, { recursive: true });
   const pyTmpDir = path.join(tempDir, 'pytmp');
   fs.mkdirSync(pyTmpDir, { recursive: true });
-  const env = buildChildProcessEnv({ TMP: pyTmpDir, TEMP: pyTmpDir });
+  const env = buildChildProcessEnv({ TMP: pyTmpDir, TEMP: pyTmpDir }, engineSpec && engineSpec.venvRoot);
   const chunkTriggerSec = Number(options.chunkTriggerSec) > 0 ? Number(options.chunkTriggerSec) : LONG_AUDIO_CHUNK_TRIGGER_SEC;
   const chunkDurationSec = Number(options.chunkDurationSec) > 0 ? Number(options.chunkDurationSec) : AUDIO_CHUNK_DURATION_SEC;
 
@@ -975,6 +1191,7 @@ function getCachedStemsForVideo(videoPath) {
   const cacheDir = getBgmCacheDir();
   const key = getBgmCacheKey(normalized);
   const bgmPath = path.join(cacheDir, `${key}_bgm.mp3`);
+  const rawBgmPath = path.join(cacheDir, `${key}_bgm_raw.mp3`);
   const vocalsPath = path.join(cacheDir, `${key}_vocals.mp3`);
   const metaPath = path.join(cacheDir, `${key}_meta.json`);
 
@@ -983,17 +1200,27 @@ function getCachedStemsForVideo(videoPath) {
   }
 
   let engine = 'ffmpeg_dsp';
+  let ambientVersion = 1;
   if (fs.existsSync(metaPath)) {
     try {
       const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
       if (meta && meta.engine) engine = meta.engine;
+      if (meta && Number.isFinite(Number(meta.ambientVersion))) {
+        ambientVersion = Number(meta.ambientVersion);
+      }
     } catch (_) {}
   }
 
+  const hasRawBgm = isValidAudioFile(rawBgmPath);
   return {
     key,
     engine,
+    ambientVersion,
+    hasRawBgm,
+    needsCleanReseparate: Boolean(isAiSeparationEngine(engine) && ambientVersion === 2 && !hasRawBgm),
+    needsAmbientUpgrade: Boolean(isAiSeparationEngine(engine) && ambientVersion < AMBIENT_BLEND_VERSION),
     bgmPath,
+    rawBgmPath: hasRawBgm ? rawBgmPath : null,
     vocalsPath,
     bgmUrl: `/bgm_cache/${key}_bgm.mp3`,
     vocalsUrl: `/bgm_cache/${key}_vocals.mp3`
@@ -1001,6 +1228,75 @@ function getCachedStemsForVideo(videoPath) {
 }
 
 const inFlightBgmJobs = new Map();
+const inFlightAmbientUpgrades = new Map();
+
+async function upgradeExistingBgmWithAmbient(videoPath, hooks = {}) {
+  if (!videoPath || typeof videoPath !== 'string') return null;
+  const normalized = path.normalize(videoPath.trim());
+  const existing = getCachedStemsForVideo(normalized);
+  if (!existing || !existing.needsAmbientUpgrade) return existing;
+
+  // v2 stems without a preserved _bgm_raw.mp3 backup already have dialogue F0/sibilants mixed in;
+  // re-run clean AI separation instead of filtering the polluted v2 stem in-place.
+  if (existing.needsCleanReseparate) {
+    const detected = detectSeparationEngine();
+    if (isAiSeparationEngine(detected.id) && fs.existsSync(normalized)) {
+      return await isolateVideoBgm(normalized, {
+        force: true,
+        isCancelled: hooks.isCancelled,
+        onProcess: hooks.onProcess,
+        onProgress: hooks.onProgress
+      });
+    }
+  }
+
+  const key = existing.key;
+  if (inFlightAmbientUpgrades.has(key)) {
+    return inFlightAmbientUpgrades.get(key);
+  }
+
+  const job = (async () => {
+    const cacheDir = getBgmCacheDir();
+    const rawBgmPath = path.join(cacheDir, `${key}_bgm_raw.mp3`);
+    const tmpRaw = `${rawBgmPath}.amb.${process.pid}.${Date.now()}.tmp.mp3`;
+    const tmpBgm = `${existing.bgmPath}.amb.${process.pid}.${Date.now()}.tmp.mp3`;
+    const metaPath = path.join(cacheDir, `${key}_meta.json`);
+    const tmpMeta = `${metaPath}.amb.${process.pid}.${Date.now()}.tmp`;
+    try {
+      let blendSourceBgm = existing.bgmPath;
+      if (isValidAudioFile(rawBgmPath)) {
+        blendSourceBgm = rawBgmPath;
+      } else if (existing.ambientVersion < 2) {
+        // v1 stem is pure un-blended AI instrumental: preserve it as _bgm_raw.mp3 before blending.
+        await fs.promises.copyFile(existing.bgmPath, tmpRaw);
+        await renameFileSafe(tmpRaw, rawBgmPath);
+        blendSourceBgm = rawBgmPath;
+      }
+      await blendAmbientSfxIntoBgm(blendSourceBgm, existing.vocalsPath, tmpBgm, hooks);
+      await renameFileSafe(tmpBgm, existing.bgmPath);
+      let meta = { engine: existing.engine, videoPath: normalized, createdAt: new Date().toISOString() };
+      if (fs.existsSync(metaPath)) {
+        try { meta = { ...meta, ...JSON.parse(fs.readFileSync(metaPath, 'utf8')) }; } catch (_) {}
+      }
+      meta.ambientVersion = AMBIENT_BLEND_VERSION;
+      meta.ambientUpgradedAt = new Date().toISOString();
+      await fs.promises.writeFile(tmpMeta, JSON.stringify(meta, null, 2), 'utf8');
+      await renameFileSafe(tmpMeta, metaPath);
+      return getCachedStemsForVideo(normalized);
+    } finally {
+      for (const f of [tmpRaw, tmpBgm, tmpMeta]) {
+        try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
+      }
+    }
+  })();
+
+  inFlightAmbientUpgrades.set(key, job);
+  try {
+    return await job;
+  } finally {
+    inFlightAmbientUpgrades.delete(key);
+  }
+}
 
 /**
  * Isolate BGM (no_vocals) and Vocals stems for a video file, with caching,
@@ -1016,13 +1312,16 @@ async function isolateVideoBgm(videoPath, options = {}) {
 
   const detected = detectSeparationEngine();
   if (!options.force) {
-    const existing = getCachedStemsForVideo(normalized);
+    let existing = getCachedStemsForVideo(normalized);
     const shouldUpgradeCachedDsp =
       existing &&
       !isAiSeparationEngine(existing.engine) &&
       options.engine !== 'ffmpeg_dsp' &&
       isAiSeparationEngine(detected.id);
     if (existing && !shouldUpgradeCachedDsp) {
+      if (existing.needsAmbientUpgrade) {
+        try { existing = await upgradeExistingBgmWithAmbient(normalized); } catch (_) {}
+      }
       return { ...existing, cached: true };
     }
   }
@@ -1184,8 +1483,12 @@ async function isolateVideoBgm(videoPath, options = {}) {
           percent: 50,
           statusText: '🎛️ កំពុងបំបែកភ្លេង BGM ដោយ FFmpeg DSP...'
         });
+        const isNarrowStereo = audioInfo.channels >= 2
+          ? await detectNarrowStereoAudio(normalized)
+          : false;
+        const bgmFilter = buildBgmFilterForChannels(audioInfo.channels, { narrowStereo: isNarrowStereo });
         await Promise.all([
-          runFfmpegExtract(normalized, buildBgmFilterForChannels(audioInfo.channels), tmpBgmPath, '192k', {
+          runFfmpegExtract(normalized, bgmFilter, tmpBgmPath, '192k', {
             isCancelled: checkCancelledAny,
             onProcess: registerProc
           }),
@@ -1196,6 +1499,29 @@ async function isolateVideoBgm(videoPath, options = {}) {
         ]);
       }
 
+      const rawBgmPath = path.join(cacheDir, `${key}_bgm_raw.mp3`);
+      let preservedRawBgm = false;
+      if (isAiSeparationEngine(usedEngine)) {
+        const rawBgmTmp = `${tmpBgmPath}.raw.mp3`;
+        try {
+          await renameFileSafe(tmpBgmPath, rawBgmTmp);
+          await blendAmbientSfxIntoBgm(rawBgmTmp, tmpVocalsPath, tmpBgmPath, {
+            isCancelled: checkCancelledAny,
+            onProcess: registerProc
+          });
+          await renameFileSafe(rawBgmTmp, rawBgmPath);
+          preservedRawBgm = isValidAudioFile(rawBgmPath);
+        } catch (ambErr) {
+          if (ambErr && ambErr.cancelled) throw ambErr;
+          if (!isValidAudioFile(tmpBgmPath) && isValidAudioFile(rawBgmTmp)) {
+            await renameFileSafe(rawBgmTmp, tmpBgmPath);
+          }
+          console.warn('[audio/isolate-bgm] Ambient blend fallback to raw AI stem:', ambErr.message);
+        } finally {
+          try { if (fs.existsSync(rawBgmTmp)) fs.unlinkSync(rawBgmTmp); } catch (_) {}
+        }
+      }
+
       await Promise.all([
         renameFileSafe(tmpBgmPath, bgmPath),
         renameFileSafe(tmpVocalsPath, vocalsPath)
@@ -1204,6 +1530,8 @@ async function isolateVideoBgm(videoPath, options = {}) {
       try {
         await fs.promises.writeFile(tmpMetaPath, JSON.stringify({
           engine: usedEngine,
+          ambientVersion: AMBIENT_BLEND_VERSION,
+          hasRawBgm: preservedRawBgm,
           videoPath: normalized,
           createdAt: new Date().toISOString()
         }, null, 2), 'utf8');
@@ -1230,6 +1558,8 @@ async function isolateVideoBgm(videoPath, options = {}) {
       cached: false,
       key,
       engine: usedEngine,
+      ambientVersion: AMBIENT_BLEND_VERSION,
+      needsAmbientUpgrade: false,
       bgmPath,
       vocalsPath,
       bgmUrl: `/bgm_cache/${key}_bgm.mp3`,
@@ -1342,6 +1672,34 @@ router.post('/isolate-bgm', async (req, res) => {
 });
 
 /**
+ * POST /api/audio/upgrade-ambient
+ * Instant (<1s) ambient SFX recovery blend on existing cached UVR BGM+Vocal stems.
+ */
+router.post('/upgrade-ambient', async (req, res) => {
+  const { videoPath } = req.body || {};
+  const check = validateVideoPathInput(videoPath);
+  if (!check.ok) {
+    return res.status(check.status).json({ success: false, error: check.error });
+  }
+  try {
+    const upgraded = await upgradeExistingBgmWithAmbient(check.normalized);
+    if (!upgraded) {
+      return res.json({ success: true, ready: false });
+    }
+    return res.json({
+      success: true,
+      ready: true,
+      ...upgraded
+    });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+/**
  * DELETE /api/audio/cache
  * Clear cached BGM and vocal stems.
  */
@@ -1407,9 +1765,13 @@ function cancelActiveBgmProcesses() {
 }
 
 router.BGM_ISOLATION_FILTER = BGM_ISOLATION_FILTER;
+router.MONO_SAFE_BGM_FILTER = MONO_SAFE_BGM_FILTER;
 router.VOCAL_ISOLATION_FILTER = VOCAL_ISOLATION_FILTER;
 router.buildBgmFilterForChannels = buildBgmFilterForChannels;
 router.buildVocalFilterForChannels = buildVocalFilterForChannels;
+router.detectNarrowStereoAudio = detectNarrowStereoAudio;
+router.blendAmbientSfxIntoBgm = blendAmbientSfxIntoBgm;
+router.upgradeExistingBgmWithAmbient = upgradeExistingBgmWithAmbient;
 router.getBgmCacheDir = getBgmCacheDir;
 router.cancelActiveBgmProcesses = cancelActiveBgmProcesses;
 router.getAiModelsDir = getAiModelsDir;
